@@ -20,10 +20,12 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Game code linked into an RPX, static constructors and `main()` run on hardware | ✅ |
 | Disc access from SD card (`DVD*`), threads, mutexes, alarms, heaps | ✅ first version |
 | 60 Hz frame clock (`VIWaitForRetrace`, retrace callbacks) | ✅ |
-| Wii blocking primitives safe on Cafe OS (no scheduler calls with interrupts off) | 🔧 testing (first-boot 7) |
+| Wii blocking primitives safe on Cafe OS (no scheduler calls with interrupts off) | ✅ |
+| Game main loop running (boot splash screen) | ✅ first-boot 7 |
+| Direct GPU writes (`0xCC008000`) redirected to a RAM window | 🔧 testing (first-boot 8) |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
-Current boot reaches `ITF::GameInterface::init`, loads `bootsequence_WII.ipk` and `menus_WII.ipk`.
+Current boot reaches the game's main loop and draws the boot splash screen (no video output yet).
 
 ## How it works
 

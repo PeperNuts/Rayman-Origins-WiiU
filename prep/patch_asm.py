@@ -12,7 +12,7 @@ patched_units = []
 for fn in sorted(os.listdir(src)):
     if not fn.endswith('.s'): continue
     text = open(os.path.join(src, fn)).read()
-    if 'GQR' not in text and '0x8000\n' not in text and not re.search(r'lis r\d+, 0x8000$', text, re.M):
+    if 'GQR' not in text and not re.search(r'lis r\d+, 0x(8000|cc01)$', text, re.M | re.I):
         continue
     L = text.split('\n'); changed = 0
     for i, line in enumerate(L):
@@ -21,6 +21,12 @@ for fn in sorted(os.listdir(src)):
         pre, op, args = m.groups()
         if op == 'mtspr' and args.startswith('GQR'):
             L[i] = pre + 'nop  # wiiu: was mtspr ' + args; changed += 1; continue
+        if op == 'lis' and re.fullmatch(r'r\d+, 0xcc01', args, re.I):
+            # Wii GPU write-gather pipe (stores to 0xCC008000): point at a RAM window instead.
+            rx = args.split(',')[0]
+            L[i] = pre + f'lis {rx}, wii_gx_wgp_window@ha  # wiiu: was lis {rx}, 0xcc01'
+            changed += 1
+            continue
         if op == 'lis' and re.fullmatch(r'r\d+, 0x8000', args):
             rx = args.split(',')[0]
             # find the 0xF8 load from rx within the next 6 instructions

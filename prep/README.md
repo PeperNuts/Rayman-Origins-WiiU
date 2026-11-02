@@ -10,6 +10,8 @@ They are committed as used during development and still assume this layout
 | `~/port` | working directory for the steps below |
 | `~/tools/binutils` | powerpc-eabi binutils (e.g. encounter/gc-wii-binutils 2.42) |
 
+`make_game_object.sh` runs steps 3-5 in one go.
+
 ## Steps
 
 1. **Build the decomp** (`decomp/`): `python configure.py && ninja` must end with `main.dol: OK`.
@@ -17,7 +19,8 @@ They are committed as used during development and still assume this layout
 2. **Classify units** - `boundary.py` (kept vs. replaced Wii SDK units), `boundary2.py` (boundary symbols,
    linker-folded bodies), `scan.py` (privileged instructions, hardware addresses in kept code).
 3. **Patch assembly** - `patch_asm.py <asm dir> <out dir>`: GQR writes become `nop`, reads of the Wii bus
-   clock at `0x800000F8` read `wii_OSBusClock`. Assemble the patched units with `powerpc-eabi-as -mgekko`.
+   clock at `0x800000F8` read `wii_OSBusClock`, and the 111 `lis rX, 0xCC01` that address the GPU
+   write-gather pipe (stores to `0xCC008000`) point at `wii_gx_wgp_window` instead. Assemble the patched units with `powerpc-eabi-as -mgekko`.
 4. **Partial link** - `powerpc-eabi-ld -r -d -T game_r.ld -o game_r.o @objs.txt` over the kept objects
    (patched ones substituted) plus dtk's `auto_*` objects; `__ppc_eabi_init.o` is excluded.
 5. **Isolate symbols** with `powerpc-eabi-objcopy`:
