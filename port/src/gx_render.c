@@ -36,7 +36,8 @@
 #include "gx.h"
 #include "port.h"
 
-#define EFB_SCALE 2
+static int sEfbScale = 1; // 1 = Wii resolution, 2 with "efb2x" in port.cfg
+#define EFB_SCALE sEfbScale
 #define SHADER_STACK (8u << 20)
 #define EFB_W (640 * EFB_SCALE)
 #define EFB_H (528 * EFB_SCALE)
@@ -1302,6 +1303,7 @@ static uint8_t sRenderStack[0x20000] __attribute__((aligned(16)));
 
 static int render_main(int argc, const char **argv)
 {
+   sEfbScale = port_cfg("efb2x") ? 2 : 1;
    WHBGfxInit();
    GX2ColorBuffer *tv = WHBGfxGetTVColourBuffer(), *drc = WHBGfxGetDRCColourBuffer();
    GX2Surface strip, pad;
@@ -1356,19 +1358,31 @@ static int render_main(int argc, const char **argv)
       if (sHaveShaders) play(pk); // the EFB clear of GXCopyDisp happens after the frame is shown (below)
       sTimePlay += OSGetSystemTime() - tp0;
 
-      port_fill(&pad, 0x000000FF);
-      int n = port_log_snapshot(rows, padRows < 40 ? padRows : 40);
-      for (int i = 0; i < n; i++) port_text(&pad, 0, i * 16, 1, rows[i], 0xE0E0E0FF);
-      port_upload(&pad);
+      // GamePad log: redraw only when new lines arrived, at most 5 times a second (CPU-drawn).
+      static OSTime lastPad;
+      static uint32_t lastLines = 0xFFFFFFFF;
+      uint32_t lines = port_log_count();
+      if (lines != lastLines && OSGetSystemTime() - lastPad > OSMillisecondsToTicks(200)) {
+         lastPad = OSGetSystemTime();
+         lastLines = lines;
+         port_fill(&pad, 0x000000FF);
+         int n = port_log_snapshot(rows, padRows < 40 ? padRows : 40);
+         for (int i = 0; i < n; i++) port_text(&pad, 0, i * 16, 1, rows[i], 0xE0E0E0FF);
+         port_upload(&pad);
+      }
 
       uint32_t secs = (uint32_t)OSTicksToSeconds(OSGetSystemTime() - start);
       snprintf(l, sizeof(l), " %s  %02u:%02u  frame %u  draws %u  verts %u  tex %u (%u MB)%s%s", port_version(),
                (unsigned)(secs / 60), (unsigned)(secs % 60), (unsigned)pk->frame, (unsigned)sLastDraws,
                (unsigned)sLastVerts, (unsigned)sNumTex, (unsigned)(sTexBytes >> 20), pk->black ? "  [VI black]" : "",
                sHaveShaders ? "" : sShaderDone ? "  [no shaders - see log]" : "  [compiling shaders]");
-      port_fill(&strip, 0x000000FF);
-      port_text(&strip, 4, 2 * big, big, l, 0xFFFFFFFF);
-      port_upload(&strip);
+      static uint32_t lastStrip = 0xFFFFFFFF;
+      if (secs != lastStrip) { // once a second
+         lastStrip = secs;
+         port_fill(&strip, 0x000000FF);
+         port_text(&strip, 4, 2 * big, big, l, 0xFFFFFFFF);
+         port_upload(&strip);
+      }
 
       gx_render_step = "present";
       WHBGfxBeginRender();

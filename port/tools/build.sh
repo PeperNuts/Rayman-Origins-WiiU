@@ -32,7 +32,7 @@ done
     "$GCCLIB/ecrti.o" "$GCCLIB/crtbegin.o" \
     "${objs[@]}" game/game_final.o \
     "$DKP/wut/lib/libwut.a" "$GCCLIB/libgcc.a" \
-    --start-group "$DKP/devkitPPC/powerpc-eabi/lib/libsysbase.a" "$DKP/devkitPPC/powerpc-eabi/lib/libc.a" --end-group \
+    --start-group "$DKP/devkitPPC/powerpc-eabi/lib/libsysbase.a" "$DKP/devkitPPC/powerpc-eabi/lib/libc.a" "$DKP/devkitPPC/powerpc-eabi/lib/libm.a" --end-group \
     "$GCCLIB/libgcc.a" "$GCCLIB/crtend.o" "$GCCLIB/ecrtn.o"
 
 # GX FIFO stores -> stream trampolines (gx_core.c parses the stream)

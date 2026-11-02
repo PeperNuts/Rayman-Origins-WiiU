@@ -46,6 +46,7 @@ int port_cfg(const char *word);
 #define PORT_LOG_COLS 240
 int port_log_snapshot(char out[][PORT_LOG_COLS], int rows);
 void port_log_udp_start(void);
+uint32_t port_log_count(void);
 struct GX2Surface;
 int port_make_surface(struct GX2Surface *s, uint32_t w, uint32_t h);
 void port_fill(struct GX2Surface *s, uint32_t rgba);

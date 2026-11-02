@@ -42,7 +42,7 @@ extern char port_wgp_tramp[];
 // ---------------------------------------------------------------------------------------
 typedef struct { uint8_t cnt, type, frac; } Vat;
 typedef struct { uint8_t enable, ambSrc, matSrc; } ChanCtrl;
-typedef struct { uint8_t func, src, mtx; } TexGen;
+typedef struct { uint8_t func, src, mtx, post, normalize; } TexGen;
 
 static struct {
    uint8_t vcd[VA_MAX];
@@ -52,6 +52,7 @@ static struct {
    uint8_t stride[VA_MAX];
    float posMtx[10][12];
    float texMtx[10][12];
+   float postMtx[20][12];  // dual-transform (post) matrices GX_PTTEXMTX0..19 (ids 64..121)
    uint8_t texMtxType[10];
    uint32_t curPosMtx;
    TexGen texGen[8];
@@ -231,7 +232,8 @@ static void defaults(void)
       G.posMtx[i][0] = G.posMtx[i][5] = G.posMtx[i][10] = 1;
       G.texMtx[i][0] = G.texMtx[i][5] = G.texMtx[i][10] = 1;
    }
-   for (int i = 0; i < 8; i++) G.texGen[i] = (TexGen){1, 4 + i, 60};
+   for (int i = 0; i < 8; i++) G.texGen[i] = (TexGen){1, 4 + i, 60, 125, 0};
+   for (int i = 0; i < 20; i++) G.postMtx[i][0] = G.postMtx[i][5] = G.postMtx[i][10] = 1;
    G.numChans = 1;
    G.numTexGens = 1;
    for (int i = 0; i < 2; i++)
@@ -410,11 +412,22 @@ static void decode_vertex(int fmt, const uint8_t **pp, GxVertex *o)
       else if (tg->src == 19 || tg->src == 20) { in[0] = o->c0[0]; in[1] = o->c0[1]; }
       else continue;
       int mtx = tmIdx[i] >= 0 ? tmIdx[i] : tg->mtx;
-      if (tg->func > 1 || mtx >= 60 || mtx < 30) { tc[0] = in[0]; tc[1] = in[1]; continue; }
-      int mi = (mtx - 30) / 3;
-      float r[3];
-      mtx_apply(G.texMtx[mi], in, r, tg->func == 0 ? 3 : 2);
-      tc[0] = r[0]; tc[1] = r[1]; tc[2] = tg->func == 0 ? r[2] : 1.0f;
+      float r[3] = {in[0], in[1], 1.0f};
+      if (tg->func <= 1 && mtx >= 30 && mtx < 60) {
+         mtx_apply(G.texMtx[(mtx - 30) / 3], in, r, tg->func == 0 ? 3 : 2);
+         if (tg->func == 1) r[2] = 1.0f;
+      }
+      // Revolution GX always applies the dual (post) transform: optional normalisation, then
+      // a 3x4 post matrix (Bink scales its texel-space coordinates this way).
+      if (tg->post != 125 && tg->post >= 64 && tg->post < 124) {
+         if (tg->normalize) {
+            float l = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+            if (l > 0) { r[0] /= l; r[1] /= l; r[2] /= l; }
+         }
+         float v[4] = {r[0], r[1], r[2], 1.0f};
+         mtx_apply(G.postMtx[(tg->post - 64) / 3], v, r, 3);
+      }
+      tc[0] = r[0]; tc[1] = r[1]; tc[2] = r[2];
    }
 }
 
@@ -755,7 +768,11 @@ void wii_GXSetCurrentMtx(uint32_t id) { FLUSH(); G.curPosMtx = id / 3; }
 void wii_GXLoadTexMtxImm(const float *m, uint32_t id, uint32_t type)
 {
    FLUSH();
-   if (id < 30 || id >= 60) return; // post-transform matrices: dual texture transform not used
+   if (id >= 64 && id < 124) { // post-transform matrix (always 3x4)
+      memcpy(G.postMtx[(id - 64) / 3], m, 12 * sizeof(float));
+      return;
+   }
+   if (id < 30 || id >= 60) return;
    int i = (id - 30) / 3;
    memset(G.texMtx[i], 0, sizeof(G.texMtx[i]));
    memcpy(G.texMtx[i], m, (type == 1 ? 8 : 12) * sizeof(float));
@@ -766,7 +783,7 @@ void wii_GXLoadTexMtxImm(const float *m, uint32_t id, uint32_t type)
 void wii_GXSetTexCoordGen2(uint32_t dst, uint32_t func, uint32_t src, uint32_t mtx, int normalize, uint32_t post)
 {
    FLUSH();
-   if (dst < 8) G.texGen[dst] = (TexGen){(uint8_t)func, (uint8_t)src, (uint8_t)mtx};
+   if (dst < 8) G.texGen[dst] = (TexGen){(uint8_t)func, (uint8_t)src, (uint8_t)mtx, (uint8_t)post, (uint8_t)(normalize != 0)};
 }
 
 void wii_GXSetNumTexGens(uint8_t n) { FLUSH(); G.numTexGens = n; }

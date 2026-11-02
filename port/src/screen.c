@@ -174,3 +174,5 @@ void port_log_udp_start(void)
    OSSetThreadName(&sUdp, "Rayman log sender");
    OSResumeThread(&sUdp);
 }
+
+uint32_t port_log_count(void) { return sCount; }
