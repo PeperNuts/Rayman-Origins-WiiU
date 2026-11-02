@@ -43,6 +43,7 @@ static void retrace(OSAlarm *alarm, OSContext *ctx)
       for (int i = 2; i < 5; i++) port_cpu1_sample[i] = sp ? chain_ra(&sp) : 0;
       port_cpu1_sample_frame = count;
    }
+   port_gx_retrace(); // "GPU" finishes the queued frame: breakpoint callback first
    void *pre = sPreCallback;
    if (pre) { port_in_frame_callback = 1; game_call(pre, count, 0, 0); }
    OSWakeupThread(&sRetraceQueue);

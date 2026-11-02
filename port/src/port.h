@@ -28,6 +28,10 @@ const char *port_dvd_file_name(uint32_t i);
 void port_vi_init(void);
 uint32_t port_vi_retrace_count(void);
 
+// wii_gx.c
+void port_gx_retrace(void);
+uint32_t port_gx_breakpoints(void);
+
 // watch.c
 void port_watch_start(void);
 

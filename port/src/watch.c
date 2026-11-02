@@ -10,6 +10,7 @@
 #include <coreinit/time.h>
 #include <whb/log.h>
 #include <whb/log_console.h>
+#include <proc_ui/procui.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -76,7 +77,7 @@ static int watch_main(int argc, const char **argv)
    uint32_t lastFrames = 0, frozen = 0;
    static char buf[1400];
    for (;;) {
-      WHBLogConsoleDraw();
+      if (ProcUIInForeground()) WHBLogConsoleDraw(); // never touch the screen in the background
       OSSleepTicks(OSMillisecondsToTicks(100));
       if (++ticks % 10) continue;
       seconds++;
@@ -90,8 +91,9 @@ static int watch_main(int argc, const char **argv)
 
       if (seconds <= 10 || seconds % 5 == 0) {
          describe_cpu1(buf, sizeof(buf));
-         WHBLogPrintf("[watch] %us st%d calls %u funcs %u files %u frames %u %s", (unsigned)seconds, port_stage(),
-                      (unsigned)trace_calls(), (unsigned)distinct, (unsigned)files, (unsigned)frames, buf);
+         WHBLogPrintf("[watch] %us st%d calls %u funcs %u files %u frames %u gpu %u %s", (unsigned)seconds, port_stage(),
+                      (unsigned)trace_calls(), (unsigned)distinct, (unsigned)files, (unsigned)frames,
+                      (unsigned)port_gx_breakpoints(), buf);
       }
 
       // Steady state is fine while frames advance: print what the game is doing instead.

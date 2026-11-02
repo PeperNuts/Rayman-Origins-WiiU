@@ -23,7 +23,8 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Wii blocking primitives safe on Cafe OS (no scheduler calls with interrupts off) | ✅ |
 | Game main loop running (boot splash screen) | ✅ first-boot 7 |
 | Direct GPU writes (`0xCC008000`) redirected to a RAM window | ✅ runs stably in the main loop |
-| Wii Remote + Nunchuk via the Wii U's KPAD/WPAD (padscore) | 🔧 testing (first-boot 10) |
+| Wii Remote + Nunchuk via the Wii U's KPAD/WPAD (padscore) | ✅ connects (first-boot 10) |
+| GX FIFO-breakpoint / draw-sync completion signals (render loop at 60 fps) | 🔧 testing (first-boot 12) |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
 Current boot reaches the game's main loop and the Health & Safety screen, which waits for A (no video output yet).
@@ -44,6 +45,7 @@ Current boot reaches the game's main loop and the Health & Safety screen, which 
    - `wii_dvd.c` — `DVD*` on top of files in `sd:/rayman/files`, keeping Wii struct layouts and
      asynchronous callbacks (the game's file layer depends on both)
    - `wii_vi.c` — 60 Hz retrace clock
+   - `wii_gx.c` — GX completion signals (FIFO breakpoint callback, draw-sync tokens)
    - `wii_kpad.c` — Wii Remotes through the Wii U's own KPAD/WPAD (same `KPADStatus` layout)
    - `port/tools/gen_stubs.py` — everything else: copies self-contained Wii functions verbatim, copies data
      tables, and generates tracing stubs for the rest
