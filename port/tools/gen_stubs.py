@@ -93,6 +93,20 @@ for i, n in enumerate(names):
         out += [f'    .size {n}, .-{n}']
         stats['copied_code'] += 1
         continue
+    # Linker-folded trivial bodies that only have an address-style name (e.g. Lock_800101C0):
+    # copy the original instructions up to the first blr if the body is branch-free.
+    m = re.search(r'_([0-9A-F]{8})$', base)
+    if m and not s:
+        addr = int(m.group(1), 16)
+        b = dol_bytes(addr, 32)
+        words = [struct.unpack('>I', b[k:k + 4])[0] for k in range(0, len(b), 4)] if b else []
+        if 0x4E800020 in words:
+            body = words[:words.index(0x4E800020) + 1]
+            if all((w >> 26) not in (16, 18, 19) or w == 0x4E800020 for w in body):
+                out += [f'    .global {n}', f'    .type {n}, @function', f'{n}:  # original Wii code from 0x{addr:08X}',
+                        '    .long ' + ','.join('0x%08X' % w for w in body), f'    .size {n}, .-{n}']
+                stats['copied_code'] += 1
+                continue
     ret = RETURNS.get(base, 0)
     out += [f'    .global {n}', f'    .type {n}, @function', f'{n}:',
             f'    lis 3, .Lname{i}@ha', f'    addi 3, 3, .Lname{i}@l', f'    li 4, {ret}', '    b stub_hit',

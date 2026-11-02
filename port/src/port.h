@@ -40,6 +40,12 @@ int port_stage(void);
 const char *port_version(void);
 OSThread *port_boot_thread(void);
 
+// wii_os.c (shared helpers)
+void *port_map_get(const void *key, uint32_t kind, uint32_t size, int *created);
+int port_irq_enable_for_block(void);
+void port_irq_restore_after_block(int was);
+enum { PORT_MAP_RR_MUTEX = 16, PORT_MAP_RR_SEM, PORT_MAP_RR_THREAD };
+
 // wii_os.c (threads)
 int port_game_threads(OSThread **out, int max);
 

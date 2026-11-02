@@ -174,6 +174,11 @@ static inline void irq_restore_after_block(int was)
 
 #define POLL_TICKS OSMicrosecondsToTicks(200)
 
+// Shared with the other replacement layers (wii_rad.c).
+void *port_map_get(const void *key, uint32_t kind, uint32_t size, int *created) { return map_get(key, kind, size, created); }
+int port_irq_enable_for_block(void) { return irq_enable_for_block(); }
+void port_irq_restore_after_block(int was) { irq_restore_after_block(was); }
+
 // ---------------------------------------------------------------------------------------
 // Memory: arenas and OS heaps
 // ---------------------------------------------------------------------------------------
