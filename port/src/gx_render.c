@@ -10,6 +10,8 @@
 #include <coreinit/cache.h>
 #include <coreinit/dynload.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/semaphore.h>
+#include <stdlib.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
 #include <gx2/clear.h>
@@ -35,6 +37,7 @@
 #include "port.h"
 
 #define EFB_SCALE 2
+#define SHADER_STACK (8u << 20)
 #define EFB_W (640 * EFB_SCALE)
 #define EFB_H (528 * EFB_SCALE)
 
@@ -453,6 +456,25 @@ static TexEntry *find_tex(uint32_t image)
    return NULL;
 }
 
+// A texture whose contents keep changing at the same address is a video frame (Bink).
+static uint32_t sVideoTex;
+static void video_note(const GxTexKey *k)
+{
+   static uint32_t addr[16], cnt[16];
+   if (sVideoTex) return;
+   for (int i = 0; i < 16; i++) {
+      if (addr[i] == k->image || !addr[i]) {
+         addr[i] = k->image;
+         if (++cnt[i] == 3) {
+            sVideoTex = k->image;
+            WHBLogPrintf("[video] texture %08X %ux%u fmt %u wrap %u/%u mip %u changes every frame", (unsigned)k->image, k->width,
+                         k->height, k->fmt, k->wrapS, k->wrapT, k->mipmap);
+         }
+         return;
+      }
+   }
+}
+
 static GX2Texture *get_texture(const GxTexKey *k)
 {
    if (!k->image || !k->width || !k->height) return &sWhite;
@@ -462,6 +484,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
       if (e->render) { e->lastUsed = sFrame; return &e->tex; }
       if (e->key.width == k->width && e->key.height == k->height && e->key.fmt == k->fmt) {
          if (e->hash == content_hash(k)) { e->lastUsed = sFrame; return &e->tex; }
+         video_note(k);
          MEMFreeToDefaultHeap(e->tex.surface.image); // contents changed: decode again
          sTexBytes -= e->bytes;
          *e = sTex[--sNumTex];
@@ -551,6 +574,216 @@ static void set_uniform(int vertex, int32_t off, uint32_t count, const void *dat
    else GX2SetPixelUniformReg(off, count, data);
 }
 
+// ---------------------------------------------------------------------------------------
+// Specialised TEV shaders: one straight-line pixel shader per TEV configuration, generated
+// from the state and compiled in the background (CPU0, big stack). Until a configuration's
+// shader is ready, the ubershader draws it. Values that change per draw (registers, konst
+// colours, swap tables, alpha references, texcoord scales) stay uniforms.
+// ---------------------------------------------------------------------------------------
+typedef struct {
+   uint32_t key;
+   volatile int state;      // 0 queued, 1 ready, 2 failed
+   GX2PixelShader *ps;
+   int32_t oStage, oRegs, oKonst, oSwap, oMisc;
+   uint32_t size;
+   char *src;
+} SpecProg;
+
+#define MAX_SPEC 384
+static SpecProg sSpec[MAX_SPEC];
+static volatile int sNumSpec;
+static OSSemaphore sSpecSem;
+static OSThread sSpecThread __attribute__((aligned(16)));
+static int sSpecOn;
+static uint32_t sSpecStats[3]; // compiled, failed, draws with specialised shader
+
+static int rnd(float f) { return (int)(f + (f < 0 ? -0.5f : 0.5f)); }
+
+static uint32_t spec_key(const GxState *st)
+{
+   int ns = rnd(st->misc[0][0]);
+   if (ns > GX_MAX_STAGES) ns = GX_MAX_STAGES;
+   uint32_t h = 2166136261u ^ (uint32_t)ns;
+   const uint8_t *b = (const uint8_t *)st->stage;
+   for (uint32_t i = 0; i < (uint32_t)ns * 7 * 16; i++) {
+      if ((i % 112) >= 96 + 4) continue; // row 6: only .x (tex swap) is configuration
+      h = (h ^ b[i]) * 16777619u;
+   }
+   float a[3] = {st->misc[0][1], st->misc[0][3], st->misc[1][0]};
+   b = (const uint8_t *)a;
+   for (int i = 0; i < 12; i++) h = (h ^ b[i]) * 16777619u;
+   return h ? h : 1;
+}
+
+static const char *const kCin[16] = {"p.rgb", "vec3(p.a)", "r0.rgb", "vec3(r0.a)", "r1.rgb", "vec3(r1.a)", "r2.rgb",
+                                     "vec3(r2.a)", "t.rgb", "vec3(t.a)", "r.rgb", "vec3(r.a)", "vec3(1.0)", "vec3(0.5)",
+                                     "kc", "vec3(0.0)"};
+static const char *const kAin[8] = {"p.a", "r0.a", "r1.a", "r2.a", "t.a", "r.a", "ka", "0.0"};
+static const float kBias[3] = {0.0f, 0.5f, -0.5f};
+static const float kScale[4] = {1.0f, 2.0f, 4.0f, 0.5f};
+
+#define EMIT(...) (n += snprintf(out + n, (size_t)(cap - n > 0 ? cap - n : 0), __VA_ARGS__))
+
+static void emit_acmp(char *out, int *pn, int cap, const char *name, int f, const char *ref)
+{
+   int n = *pn;
+   static const char *const ops[8] = {"false", "%s < %s", "abs(%s - %s) < 0.002", "%s <= %s + 0.002", "%s > %s",
+                                      "abs(%s - %s) >= 0.002", "%s >= %s - 0.002", "true"};
+   EMIT("  bool %s = ", name);
+   if (f == 0 || f == 7) EMIT("%s;\n", ops[f]);
+   else { EMIT(ops[f & 7], "p.a", ref); EMIT(";\n"); }
+   *pn = n;
+}
+
+static int spec_source(const GxState *st, char *out, int cap)
+{
+   int n = 0, ns = rnd(st->misc[0][0]);
+   if (ns > GX_MAX_STAGES) ns = GX_MAX_STAGES;
+   if (ns < 1) ns = 1;
+   uint32_t slots = 0;
+   for (int s = 0; s < ns; s++) {
+      int slot = rnd(st->stage[s * 7 + 5][0]);
+      if (slot >= 0 && slot < GX_MAX_SLOTS) slots |= 1u << slot;
+   }
+   EMIT("#version 420 core\n"
+        "layout(location = 0) in vec4 vC0; layout(location = 1) in vec4 vC1;\n"
+        "layout(location = 2) in vec4 vT0; layout(location = 3) in vec4 vT1;\n"
+        "layout(location = 4) in vec4 vT2; layout(location = 5) in vec4 vT3;\n"
+        "layout(location = 0) out vec4 fragColor;\n");
+   for (int i = 0; i < GX_MAX_SLOTS; i++)
+      if (slots & (1u << i)) EMIT("layout(binding = %d) uniform sampler2D uTex%d;\n", i, i);
+   EMIT("uniform vec4 uStage[56];\nuniform vec4 uRegs[4];\nuniform vec4 uKonst[4];\nuniform vec4 uSwap[4];\nuniform vec4 uMisc[2];\n"
+        "int ri(float f) { return int(floor(f + 0.5)); }\n"
+        "vec4 swz(vec4 c, int t) { vec4 s = uSwap[t]; return vec4(c[ri(s.x)], c[ri(s.y)], c[ri(s.z)], c[ri(s.w)]); }\n"
+        "bool cmp(int op, float a, float b) { return (op & 1) == 0 ? a > b + 0.5 / 255.0 : abs(a - b) < 0.5 / 255.0; }\n"
+        "float pk(vec3 c, int n) { vec3 q = floor(c * 255.0 + 0.5); return n == 1 ? q.r : (n == 2 ? q.g * 256.0 + q.r : q.b * 65536.0 + q.g * 256.0 + q.r); }\n"
+        "void main() {\n"
+        "  vec4 p = uRegs[0], r0 = uRegs[1], r1 = uRegs[2], r2 = uRegs[3];\n"
+        "  vec4 t, r; vec3 kc, rc; float ka, ra;\n");
+   for (int s = 0; s < ns; s++) {
+      const float(*q)[4] = &st->stage[s * 7];
+      int ci[4], ai[4];
+      for (int k = 0; k < 4; k++) { ci[k] = rnd(q[0][k]) & 15; ai[k] = rnd(q[1][k]) & 7; }
+      int cop = rnd(q[2][0]), aop = rnd(q[3][0]);
+      int slot = rnd(q[5][0]), coord = rnd(q[5][1]), chan = rnd(q[5][2]), rsw = rnd(q[5][3]) & 3, tsw = rnd(q[6][0]) & 3;
+      int kcs = rnd(q[4][2]), kas = rnd(q[4][3]), oc = rnd(q[4][0]) & 3, oa = rnd(q[4][1]) & 3;
+      EMIT("  // stage %d\n", s);
+      if (slot >= 0 && slot < GX_MAX_SLOTS) {
+         if (coord < 0 || coord > 3) coord = 0;
+         EMIT("  t = swz(texture(uTex%d, vT%d.xy / (abs(vT%d.z) < 1e-6 ? 1.0 : vT%d.z) * uStage[%d].yz), %d);\n", slot, coord, coord,
+              coord, s * 7 + 6, tsw);
+      } else EMIT("  t = vec4(1.0);\n");
+      EMIT("  r = swz(%s, %d);\n", chan == 0 ? "vC0" : chan == 1 ? "vC1" : "vec4(0.0)", rsw);
+      if (kcs < 8) EMIT("  kc = vec3(%.5f);\n", (8 - kcs) / 8.0f);
+      else if (kcs >= 12 && kcs < 16) EMIT("  kc = uKonst[%d].rgb;\n", kcs - 12);
+      else if (kcs >= 16 && kcs < 32) EMIT("  kc = vec3(uKonst[%d].%c);\n", kcs & 3, "rgba"[(kcs - 16) >> 2]);
+      else EMIT("  kc = vec3(1.0);\n");
+      if (kas < 8) EMIT("  ka = %.5f;\n", (8 - kas) / 8.0f);
+      else if (kas >= 16 && kas < 32) EMIT("  ka = uKonst[%d].%c;\n", kas & 3, "rgba"[(kas - 16) >> 2]);
+      else EMIT("  ka = 1.0;\n");
+      if (cop < 2)
+         EMIT("  rc = (%s %c mix(%s, %s, %s) + vec3(%.5f)) * %.5f;\n", kCin[ci[3]], cop == 1 ? '-' : '+', kCin[ci[0]], kCin[ci[1]],
+              kCin[ci[2]], kBias[rnd(q[2][1]) % 3], kScale[rnd(q[2][2]) & 3]);
+      else if (cop >= 14)
+         EMIT("  { vec3 a = %s, b = %s, c = %s; rc = %s + vec3(cmp(%d, a.r, b.r) ? c.r : 0.0, cmp(%d, a.g, b.g) ? c.g : 0.0, cmp(%d, a.b, b.b) ? c.b : 0.0); }\n",
+              kCin[ci[0]], kCin[ci[1]], kCin[ci[2]], kCin[ci[3]], cop, cop, cop);
+      else
+         EMIT("  rc = %s + (cmp(%d, pk(%s, %d), pk(%s, %d)) ? %s : vec3(0.0));\n", kCin[ci[3]], cop, kCin[ci[0]], (cop - 8) / 2 + 1,
+              kCin[ci[1]], (cop - 8) / 2 + 1, kCin[ci[2]]);
+      if (aop < 2)
+         EMIT("  ra = (%s %c mix(%s, %s, %s) + %.5f) * %.5f;\n", kAin[ai[3]], aop == 1 ? '-' : '+', kAin[ai[0]], kAin[ai[1]],
+              kAin[ai[2]], kBias[rnd(q[3][1]) % 3], kScale[rnd(q[3][2]) & 3]);
+      else
+         EMIT("  ra = %s + (cmp(%d, %s, %s) ? %s : 0.0);\n", kAin[ai[3]], aop, kAin[ai[0]], kAin[ai[1]], kAin[ai[2]]);
+      EMIT(q[2][3] > 0.5f ? "  rc = clamp(rc, 0.0, 1.0);\n" : "  rc = clamp(rc, -4.0, 4.0);\n");
+      EMIT(q[3][3] > 0.5f ? "  ra = clamp(ra, 0.0, 1.0);\n" : "  ra = clamp(ra, -4.0, 4.0);\n");
+      static const char *const regs[4] = {"p", "r0", "r1", "r2"};
+      EMIT("  %s.rgb = rc; %s.a = ra;\n", regs[oc], regs[oa]);
+   }
+   int c0 = rnd(st->misc[0][1]) & 7, c1 = rnd(st->misc[1][0]) & 7, aop = rnd(st->misc[0][3]) & 3;
+   if (!((c0 == 7 && c1 == 7 && aop <= 1) || (aop == 1 && (c0 == 7 || c1 == 7)))) {
+      emit_acmp(out, &n, cap, "t0", c0, "uMisc[0].z");
+      emit_acmp(out, &n, cap, "t1", c1, "uMisc[1].y");
+      static const char *const comb[4] = {"t0 && t1", "t0 || t1", "t0 != t1", "t0 == t1"};
+      EMIT("  if (!(%s)) discard;\n", comb[aop]);
+   }
+   EMIT("  fragColor = clamp(p, 0.0, 1.0);\n}\n");
+   return n < cap;
+}
+
+static int spec_main(int argc, const char **argv)
+{
+   static char log[512];
+   for (;;) {
+      OSWaitSemaphore(&sSpecSem);
+      for (int i = 0; i < sNumSpec; i++) {
+         SpecProg *p = &sSpec[i];
+         if (p->state != 0 || !p->src) continue;
+         log[0] = 0;
+         GX2PixelShader *ps = glslPS(p->src, log, sizeof(log), 0);
+         if (ps) {
+            p->oStage = uniform_offset(ps->uniformVars, ps->uniformVarCount, "uStage");
+            p->oRegs = uniform_offset(ps->uniformVars, ps->uniformVarCount, "uRegs");
+            p->oKonst = uniform_offset(ps->uniformVars, ps->uniformVarCount, "uKonst");
+            p->oSwap = uniform_offset(ps->uniformVars, ps->uniformVarCount, "uSwap");
+            p->oMisc = uniform_offset(ps->uniformVars, ps->uniformVarCount, "uMisc");
+            uint32_t end = 0;
+            for (uint32_t k = 0; k < ps->uniformVarCount; k++) {
+               uint32_t cnt = ps->uniformVars[k].count ? ps->uniformVars[k].count : 1;
+               uint32_t e = ps->uniformVars[k].offset + cnt * 16;
+               if (e > end) end = e;
+            }
+            p->size = end ? end : 16;
+            p->ps = ps;
+            __asm__ volatile("sync" ::: "memory");
+            p->state = 1;
+            sSpecStats[0]++;
+         } else {
+            p->state = 2;
+            sSpecStats[1]++;
+            WHBLogPrintf("[spec] compile failed (key %08X): %s", (unsigned)p->key, log);
+         }
+         free(p->src);
+         p->src = NULL;
+      }
+   }
+   return 0;
+}
+
+static void spec_start(void)
+{
+   sSpecOn = !port_cfg("nospec");
+   if (!sSpecOn) return;
+   OSInitSemaphore(&sSpecSem, 0);
+   uint8_t *stack = MEMAllocFromDefaultHeapEx(SHADER_STACK, 16);
+   if (!stack || !OSCreateThread(&sSpecThread, (OSThreadEntryPointFn)spec_main, 0, NULL, stack + SHADER_STACK, SHADER_STACK, 20,
+                                 OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+      sSpecOn = 0;
+      return;
+   }
+   OSSetThreadName(&sSpecThread, "Rayman shader specialiser");
+   OSResumeThread(&sSpecThread);
+}
+
+// The specialised program for this state, or NULL (queued for compilation / unavailable).
+static SpecProg *spec_get(const GxState *st)
+{
+   if (!sSpecOn || !sBlockMode) return NULL;
+   uint32_t key = spec_key(st);
+   for (int i = 0; i < sNumSpec; i++)
+      if (sSpec[i].key == key) return sSpec[i].state == 1 ? &sSpec[i] : NULL;
+   if (sNumSpec >= MAX_SPEC) return NULL;
+   SpecProg *p = &sSpec[sNumSpec];
+   memset(p, 0, sizeof(*p));
+   p->key = key;
+   p->src = malloc(16384);
+   if (!p->src || !spec_source(st, p->src, 16384)) { free(p->src); p->src = NULL; p->state = 2; sNumSpec++; return NULL; }
+   __asm__ volatile("sync" ::: "memory");
+   sNumSpec++;
+   OSSignalSemaphore(&sSpecSem);
+   return NULL;
+}
+
 // Uniform-block memory: a ring the GPU reads at draw time (reset per packet, after the
 // previous frame's GX2DrawDone). GX2 reads uniform blocks byte-swapped (little-endian words).
 static uint8_t *ubo_alloc(uint32_t size)
@@ -566,7 +799,8 @@ static uint8_t *ubo_alloc(uint32_t size)
 
 static void ubo_put(uint8_t *block, uint32_t size, int32_t off, const void *src, uint32_t words)
 {
-   if (off < 0 || (uint32_t)off + words * 4 > size) return;
+   if (off < 0 || (uint32_t)off >= size) return;
+   if ((uint32_t)off + words * 4 > size) words = (size - (uint32_t)off) / 4; // array trimmed by the compiler
    const uint32_t *in = src;
    uint32_t *out = (uint32_t *)(block + off);
    for (uint32_t i = 0; i < words; i++) out[i] = sUboSwap ? __builtin_bswap32(in[i]) : in[i];
@@ -593,7 +827,22 @@ static void apply_state(const GxState *st)
          ubo_done(vb, sVsBlockSize);
          GX2SetVertexUniformBlock(sVsBlockLoc, sVsBlockSize, vb);
       }
-      if (pb && sPsBlockLoc >= 0) {
+      SpecProg *sp = spec_get(st);
+      if (sp) {
+         uint8_t *sb = ubo_alloc(sp->size);
+         if (sb) {
+            ubo_put(sb, sp->size, sp->oStage, st->stage, GX_MAX_STAGES * 7 * 4);
+            ubo_put(sb, sp->size, sp->oRegs, st->regs, 16);
+            ubo_put(sb, sp->size, sp->oKonst, st->konst, 16);
+            ubo_put(sb, sp->size, sp->oSwap, st->swap, 16);
+            ubo_put(sb, sp->size, sp->oMisc, st->misc, 8);
+            ubo_done(sb, sp->size);
+            GX2SetPixelShader(sp->ps);
+            GX2SetPixelUniformBlock(15, sp->size, sb);
+            sSpecStats[2]++;
+         }
+      } else if (pb && sPsBlockLoc >= 0) {
+         GX2SetPixelShader(sTev.pixelShader);
          ubo_put(pb, sPsBlockSize, uStage, st->stage, GX_MAX_STAGES * 7 * 4);
          ubo_put(pb, sPsBlockSize, uRegs, st->regs, 16);
          ubo_put(pb, sPsBlockSize, uKonst, st->konst, 16);
@@ -718,7 +967,8 @@ static void copy_tex(const GxCmd *c)
    if (c->a[4]) clear_efb(c->a[5], c->a[6]);
 }
 
-static uint32_t sDraws, sLastDraws, sLastVerts, sLastStates;
+static uint32_t sDraws, sLastDraws, sLastVerts, sLastStates, sShown;
+static OSTime sTimePlay, sTimeFinish;
 
 // ---------------------------------------------------------------------------------------
 // Self-test squares drawn into the EFB's top-left corner every frame:
@@ -913,6 +1163,32 @@ static void dump_draw(const GxPacket *pk, const GxCmd *c)
    }
 }
 
+static void video_draw(const GxPacket *pk, const GxCmd *c)
+{
+   static int n;
+   if (!sVideoTex || n >= 3) return;
+   const GxState *st = &pk->states[c->state];
+   int uses = 0;
+   for (int i = 0; i < GX_MAX_SLOTS; i++) uses |= st->tex[i].image == sVideoTex;
+   if (!uses) return;
+   n++;
+   int ns = (int)st->misc[0][0];
+   WHBLogPrintf("[video] draw %d: %u verts, %d stages", n, (unsigned)c->count, ns);
+   for (int s = 0; s < ns && s < 4; s++) {
+      const float(*q)[4] = &st->stage[s * 7];
+      int slot = rnd(q[5][0]);
+      const GxTexKey *k = slot >= 0 && slot < GX_MAX_SLOTS ? &st->tex[slot] : NULL;
+      WHBLogPrintf("[video]   st%d c %.0f %.0f %.0f %.0f a %.0f %.0f %.0f %.0f tex %d coord %.0f scale %.3f %.3f | %08X %ux%u f%u",
+                   s, q[0][0], q[0][1], q[0][2], q[0][3], q[1][0], q[1][1], q[1][2], q[1][3], slot, q[5][1], q[6][1], q[6][2],
+                   k ? (unsigned)k->image : 0, k ? k->width : 0, k ? k->height : 0, k ? k->fmt : 0);
+   }
+   for (uint32_t i = 0; i < c->count && i < 4; i++) {
+      const GxVertex *v = &pk->verts[c->first + i];
+      WHBLogPrintf("[video]   v%u pos %.1f %.1f | t0 %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f", (unsigned)i, v->pos[0], v->pos[1],
+                   v->tc[0][0], v->tc[0][1], v->tc[0][2], v->tc[1][0], v->tc[1][1], v->tc[2][0], v->tc[2][1]);
+   }
+}
+
 static void play_game(GxPacket *pk);
 static void play(GxPacket *pk)
 {
@@ -937,6 +1213,7 @@ static void play_game(GxPacket *pk)
          if (sCfgNoAfterFx && state_uses_rt(&pk->states[c->state])) break;
          if (c->state != cur) { STEP("apply state", apply_state(&pk->states[c->state])); cur = c->state; }
          dump_draw(pk, c);
+         video_draw(pk, c);
          if (c->first + c->count > pk->numVerts) break;
          gx_render_step = "draw";
          if (!sCfgNoDraw) STEP("draw", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1));
@@ -988,7 +1265,6 @@ static void present_tv(const GxPacket *pk)
 // Shader compile thread: CafeGLSL (Mesa) recurses deeply, so it gets a large stack of its
 // own instead of the render thread's.
 // ---------------------------------------------------------------------------------------
-#define SHADER_STACK (8u << 20)
 static OSThread sShaderThread __attribute__((aligned(16)));
 static volatile int sGx2Up, sCompiled;
 
@@ -1060,7 +1336,7 @@ static int render_main(int argc, const char **argv)
          OSSleepTicks(OSMillisecondsToTicks(50));
          continue;
       }
-      if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) selftest_init(); }
+      if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) { selftest_init(); spec_start(); } }
       static GxPacket idle = {.black = 1};
       GxPacket *pk = gx_acquire_packet();
       static OSTime lastShown;
@@ -1076,7 +1352,9 @@ static int render_main(int argc, const char **argv)
       lastShown = OSGetSystemTime();
       sFrame++;
 
+      OSTime tp0 = OSGetSystemTime();
       if (sHaveShaders) play(pk); // the EFB clear of GXCopyDisp happens after the frame is shown (below)
+      sTimePlay += OSGetSystemTime() - tp0;
 
       port_fill(&pad, 0x000000FF);
       int n = port_log_snapshot(rows, padRows < 40 ? padRows : 40);
@@ -1106,8 +1384,11 @@ static int render_main(int argc, const char **argv)
       port_blit(&pad, &drc->surface, 0, 0);
       WHBGfxFinishRenderDRC();
       gx_render_step = "finish";
+      OSTime tf0 = OSGetSystemTime();
       if (sHaveShaders) STEP("finish frame", WHBGfxFinishRender()); // swaps, waits for the GPU and the flip
       else WHBGfxFinishRender();
+      sTimeFinish += OSGetSystemTime() - tf0;
+      sShown++;
       gx_render_step = "idle";
 
       if (sHaveShaders && pk->clearAfter) {
@@ -1120,7 +1401,13 @@ static int render_main(int argc, const char **argv)
       if (pk != &idle) gx_release_packet(pk);
 
       if (secs >= lastReport + 5) {
+         uint32_t span = secs - lastReport;
          lastReport = secs;
+         if (sShown) WHBLogPrintf("[perf] %.1f fps shown | per frame: play %.1f ms (CPU), finish %.1f ms (GPU+vsync) | spec shaders %u ready, %u failed, %u draws",
+                                  sShown / (float)(span ? span : 1), OSTicksToMicroseconds(sTimePlay) / 1000.0f / sShown,
+                                  OSTicksToMicroseconds(sTimeFinish) / 1000.0f / sShown, (unsigned)sSpecStats[0],
+                                  (unsigned)sSpecStats[1], (unsigned)sSpecStats[2]);
+         sShown = 0; sTimePlay = sTimeFinish = 0; sSpecStats[2] = 0;
          WHBLogPrintf("[gfx] frame %u: %u draws, %u verts, %u states, %u dropped | tex %u cached (%u MB), %u decoded, %u evicted, %u rt | gx prims %u dl %u copies %u unk %u pkt drop %u",
                       (unsigned)pk->frame, (unsigned)sLastDraws, (unsigned)sLastVerts, (unsigned)sLastStates,
                       (unsigned)pk->dropped, (unsigned)sNumTex, (unsigned)(sTexBytes >> 20), (unsigned)sTexStats[0],
