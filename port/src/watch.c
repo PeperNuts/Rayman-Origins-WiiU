@@ -68,6 +68,8 @@ static int describe_threads(char *buf, size_t size)
    return n;
 }
 
+static void log_line(const char *l) { WHBLogPrintf("  %s", l); }
+
 static int watch_main(int argc, const char **argv)
 {
    uint32_t ticks = 0, seconds = 0, lastDistinct = 0, lastFiles = 0, quiet = 0;
@@ -92,9 +94,21 @@ static int watch_main(int argc, const char **argv)
                       (unsigned)trace_calls(), (unsigned)distinct, (unsigned)files, (unsigned)frames, buf);
       }
 
+      // Steady state is fine while frames advance: print what the game is doing instead.
+      if (seconds == 15 || (seconds > 15 && seconds % 30 == 15)) {
+         WHBLogPrintf("==== status at %us: %u frames, %u files ====", (unsigned)seconds, (unsigned)frames, (unsigned)files);
+         char fl[160];
+         int fn = 0;
+         for (uint32_t i = 0; i < files; i++) {
+            fn += snprintf(fl + fn, sizeof(fl) - fn, "%s ", port_dvd_file_name(i));
+            if (fn > 110 || i + 1 == files) { WHBLogPrintf("[files] %s", fl); fn = 0; }
+         }
+         WHBLogPrintf("[funcs] name:calls, in first-call order (~60 per second = every frame)");
+         trace_report(log_line, 110);
+      }
+
       const char *why = NULL;
       if (frozen == 5) why = "CPU1 stopped taking interrupts for 5 s (frame clock frozen)";
-      else if (quiet == 30) why = "no progress for 30 s";
       if (why) {
          int n = snprintf(buf, sizeof(buf), "Rayman port %s - %s\nstage %d, %u calls, %u funcs, %u files, %u frames\n",
                           port_version(), why, port_stage(), (unsigned)trace_calls(), (unsigned)distinct,

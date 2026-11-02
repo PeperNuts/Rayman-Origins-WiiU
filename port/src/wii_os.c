@@ -32,6 +32,7 @@
 static const char *sRing[TRACE_RING];
 static uint32_t sRingPos;
 static const char *sDistinct[TRACE_DISTINCT];
+static uint32_t sDistinctCalls[TRACE_DISTINCT];
 static uint32_t sDistinctCount;
 static volatile uint32_t sStubCalls;
 
@@ -42,10 +43,12 @@ int32_t stub_hit(const char *name, int32_t ret)
    uint32_t i;
    for (i = 0; i < sDistinctCount; i++) {
       if (sDistinct[i] == name) {
+         sDistinctCalls[i]++;
          return ret;
       }
    }
    if (sDistinctCount < TRACE_DISTINCT) {
+      sDistinctCalls[sDistinctCount] = 1;
       sDistinct[sDistinctCount++] = name;
       WHBLogPrintf("[stub] #%u %s -> %d", (unsigned)sDistinctCount, name, (int)ret);
    }
@@ -54,6 +57,22 @@ int32_t stub_hit(const char *name, int32_t ret)
 
 uint32_t trace_calls(void) { return sStubCalls; }
 uint32_t trace_distinct(void) { return sDistinctCount; }
+
+// "name:count" for every stub, in first-call order, packed into lines of ~width chars.
+void trace_report(void (*line)(const char *), uint32_t width)
+{
+   char buf[160];
+   size_t n = 0;
+   if (width > sizeof(buf) - 1) width = sizeof(buf) - 1;
+   for (uint32_t i = 0; i < sDistinctCount; i++) {
+      char item[72];
+      int k = snprintf(item, sizeof(item), "%s:%u ", sDistinct[i], (unsigned)sDistinctCalls[i]);
+      if (n + (size_t)k > width && n) { buf[n] = 0; line(buf); n = 0; }
+      memcpy(buf + n, item, (size_t)k);
+      n += (size_t)k;
+   }
+   if (n) { buf[n] = 0; line(buf); }
+}
 
 // Writes "first: a,b,c | last: x,y,z" into buf.
 void trace_summary(char *buf, size_t size, uint32_t nfirst, uint32_t nlast)

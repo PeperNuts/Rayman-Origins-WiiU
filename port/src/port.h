@@ -16,11 +16,13 @@ void port_register_boot_thread(OSThread *cafe);
 int32_t stub_hit(const char *name, int32_t ret);
 uint32_t trace_calls(void);
 uint32_t trace_distinct(void);
+void trace_report(void (*line)(const char *), uint32_t width);
 void trace_summary(char *buf, size_t size, uint32_t nfirst, uint32_t nlast);
 
 // wii_dvd.c
 void port_dvd_init(void);
 uint32_t port_dvd_files(void);
+const char *port_dvd_file_name(uint32_t i);
 
 // wii_vi.c
 void port_vi_init(void);

@@ -209,3 +209,4 @@ int32_t wii_DVDCancel(WiiDVDCommandBlock *cb)
 int32_t wii_DVDGetDriveStatus(void) { return DVD_STATE_END; }
 
 uint32_t port_dvd_files(void) { return (uint32_t)sEntryCount; }
+const char *port_dvd_file_name(uint32_t i) { return i < (uint32_t)sEntryCount ? sEntryPath[i] : ""; }
