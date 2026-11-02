@@ -1,0 +1,37 @@
+# --- Never commit game code or data (copyrighted) ---
+*.rvz
+*.iso
+*.wbfs
+*.dol
+*.rel
+*.elf
+*.rpx
+*.wuhb
+*.o
+*.a
+*.ipk
+*.bik
+orig/
+files/
+sd-files/
+**/asm/
+patched_asm/
+game_final.o
+undef_info.json
+
+# --- Build output / local toolchains ---
+build/
+gen/
+dkp/
+binutils/
+elf2rpl
+*.tgz
+*.zip
+*.map
+
+# --- Editor / OS ---
+__pycache__/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
