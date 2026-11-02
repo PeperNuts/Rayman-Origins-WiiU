@@ -4,7 +4,7 @@
     .align 5
     .global port_wgp_tramp
 port_wgp_tramp:
-    .space 72 * 1024
+    .space 96 * 1024
     .global port_wgp_tramp_end
 port_wgp_tramp_end:
 
@@ -19,6 +19,7 @@ port_wgp_save:
     .global port_wgp_save2
 port_wgp_save2:
     .long 0
+    .align 3
     .global port_wgp_tmp
 port_wgp_tmp:
-    .long 0
+    .long 0, 0

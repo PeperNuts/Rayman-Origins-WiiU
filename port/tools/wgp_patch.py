@@ -65,8 +65,47 @@ for l in dis.splitlines():
     if m and m.group(4) in lisregs:
         sites.append((int(m.group(1), 16), m.group(2)))
 
+# Second form: the pipe address computed once (addi rP, rLis, -0x8000) and written with
+# psq_st fS, 0(rP) - UbiArt's patch/atlas/particle/mesh vertex loops. Needs Gekko decoding
+# and register tracking (a register stops being the pipe pointer when overwritten or across
+# calls).
+gdis = subprocess.run([objdump, '-d', '-M', 'gekko', '--no-show-raw-insn', '--start-address=0x%x' % syms['__game_text_start'],
+                       '--stop-address=0x%x' % syms['__game_text_end'], elf], capture_output=True, text=True, check=True).stdout
+NOKILL = ('st', 'psq_st', 'cmp', 'b', 'mt', 'tw', 'dcb', 'icb', 'sync', 'isync', 'eieio', 'cr', 'mcrf', 'sc', 'rfi', 'nop')
+psq_sites = []
+lis, der = set(), set()
+for l in gdis.splitlines():
+    if re.match(r'^[0-9a-f]+ <.*>:$', l):
+        lis, der = set(), set()
+        continue
+    m = re.match(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*)$', l)
+    if not m:
+        continue
+    addr, mn, ops = int(m.group(1), 16), m.group(2), m.group(3)
+    o = [x.strip() for x in ops.split(',')]
+    if mn == 'lis' and len(o) == 2 and (int(o[1]) & 0xFFFF) == ha:
+        lis.add(o[0]); der.discard(o[0]); continue
+    if mn == 'addi' and len(o) == 3 and o[1] in lis and o[2] == '-32768':
+        der.add(o[0]); continue
+    if mn == 'mr' and len(o) == 2 and o[1] in der:
+        der.add(o[0]); continue
+    if mn.startswith(('st', 'psq_st')):
+        mm = re.match(r'(-?\d+)\((r\d+)\)', o[1]) if len(o) > 1 else None
+        if mm and mm.group(2) in der:
+            if mn == 'psq_st' and mm.group(1) == '0' and o[2] == '0' and o[3] == '0':
+                psq_sites.append(addr)
+            else:
+                raise SystemExit(f'unhandled pipe store {mn} {ops} at {addr:#x}')
+        continue
+    if mn in ('bl', 'blrl', 'bctrl'):
+        for r in ['r0'] + ['r%d' % i for i in range(3, 13)]:
+            lis.discard(r); der.discard(r)
+        continue
+    if not mn.startswith(NOKILL) and o and re.match(r'r\d+$', o[0]):
+        lis.discard(o[0]); der.discard(o[0])
+
 TRAMP_WORDS, FLOAT_WORDS = 7, 18
-need = sum((FLOAT_WORDS if op == 'stfs' else TRAMP_WORDS) * 4 for _, op in sites)
+need = sum((FLOAT_WORDS if op == 'stfs' else TRAMP_WORDS) * 4 for _, op in sites) + len(psq_sites) * 4 * 29
 assert need <= tramp_end - tramp, f'trampoline area too small: need {need}, have {tramp_end - tramp}'
 
 data = bytearray(open(elf, 'rb').read())
@@ -134,5 +173,36 @@ for addr, op in sites:
     put(addr, branch(addr, t))
     t += 4 * (len(seq) + 1)
 
+rot = (21 << 26) | (11 << 21) | (11 << 16) | (8 << 11) | (0 << 6) | (31 << 1)  # rotlwi r11,r11,8
+for addr in psq_sites:
+    w = word(addr)
+    assert w >> 26 == 60 and (w & 0xFFFF) == 0, hex(addr)       # psq_st fS, 0(rP), W=0, I=0
+    fs = (w >> 21) & 31
+    seq = [
+        (36 << 26) | (12 << 21) | (13 << 16) | D(off_save),      # stw  r12, save(r13)
+        (36 << 26) | (11 << 21) | (13 << 16) | D(off_save2),     # stw  r11, save2(r13)
+        (14 << 26) | (12 << 21) | (13 << 16) | D(off_tmp),       # addi r12, r13, tmp
+        (60 << 26) | (fs << 21) | (12 << 16),                    # psq_st fS, 0(r12), 0, 0
+        (32 << 26) | (11 << 21) | (12 << 16) | 0,                # lwz  r11, 0(r12)
+        (32 << 26) | (12 << 21) | (13 << 16) | D(off_ptr),       # lwz  r12, ptr(r13)
+    ]
+    for i in range(4):
+        seq += [rot, (38 << 26) | (11 << 21) | (12 << 16) | i]
+    seq += [(32 << 26) | (11 << 21) | (13 << 16) | D(off_tmp + 4)]  # lwz r11, tmp+4(r13)
+    for i in range(4):
+        seq += [rot, (38 << 26) | (11 << 21) | (12 << 16) | (4 + i)]
+    seq += [
+        (14 << 26) | (12 << 21) | (12 << 16) | 8,                # addi r12, r12, 8
+        (36 << 26) | (12 << 21) | (13 << 16) | D(off_ptr),       # stw  r12, ptr(r13)
+        (32 << 26) | (11 << 21) | (13 << 16) | D(off_save2),     # lwz  r11, save2(r13)
+        (32 << 26) | (12 << 21) | (13 << 16) | D(off_save),      # lwz  r12, save(r13)
+    ]
+    for i, x in enumerate(seq):
+        put(t + 4 * i, x)
+    put(t + 4 * len(seq), branch(t + 4 * len(seq), addr + 4))
+    put(addr, branch(addr, t))
+    t += 4 * (len(seq) + 1)
+assert t <= tramp_end, 'trampoline area overflow'
+
 open(elf, 'wb').write(data)
-print(f'wgp: patched {len(sites)} FIFO stores ({", ".join(f"{k} {sum(1 for _, o in sites if o == k)}" for k in SIZES)})')
+print(f'wgp: patched {len(sites)} FIFO stores + {len(psq_sites)} paired-single pipe stores ({", ".join(f"{k} {sum(1 for _, o in sites if o == k)}" for k in SIZES)})')
