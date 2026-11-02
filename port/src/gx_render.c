@@ -600,6 +600,32 @@ static uint32_t sSpecStats[3]; // compiled, failed, draws with specialised shade
 
 static int rnd(float f) { return (int)(f + (f < 0 ? -0.5f : 0.5f)); }
 
+static int stage_indirect(const GxState *st, int s)
+{
+   return st->indMtx[s] || st->indWrapS[s] || st->indWrapT[s] || st->indAddPrev[s];
+}
+
+static int state_indirect(const GxState *st)
+{
+   int ns = rnd(st->misc[0][0]);
+   for (int s = 0; s < ns && s < GX_MAX_STAGES; s++)
+      if (stage_indirect(st, s)) return 1;
+   return 0;
+}
+
+// Texture maps read by the active stages, including indirect lookups.
+static uint32_t state_slots(const GxState *st)
+{
+   int ns = rnd(st->misc[0][0]);
+   uint32_t used = 0;
+   for (int s = 0; s < ns && s < GX_MAX_STAGES; s++) {
+      int slot = rnd(st->stage[s * 7 + 5][0]);
+      if (slot >= 0 && slot < GX_MAX_SLOTS) used |= 1u << slot;
+      if (stage_indirect(st, s) && st->indMtx[s]) used |= 1u << (st->indMap[st->indStage[s]] & 7);
+   }
+   return used;
+}
+
 static uint32_t spec_key(const GxState *st)
 {
    int ns = rnd(st->misc[0][0]);
@@ -613,6 +639,12 @@ static uint32_t spec_key(const GxState *st)
    float a[3] = {st->misc[0][1], st->misc[0][3], st->misc[1][0]};
    b = (const uint8_t *)a;
    for (int i = 0; i < 12; i++) h = (h ^ b[i]) * 16777619u;
+   if (state_indirect(st)) {
+      b = st->indStage;
+      const uint8_t *e = (const uint8_t *)(st->indScale + 3);
+      for (; b < e; b++) h = (h ^ *b) * 16777619u;
+      for (int i = 0; i < GX_MAX_SLOTS; i++) h = (h ^ st->tex[i].wrapS ^ (st->tex[i].wrapT << 2)) * 16777619u;
+   }
    return h ? h : 1;
 }
 
@@ -641,11 +673,7 @@ static int spec_source(const GxState *st, char *out, int cap)
    int n = 0, ns = rnd(st->misc[0][0]);
    if (ns > GX_MAX_STAGES) ns = GX_MAX_STAGES;
    if (ns < 1) ns = 1;
-   uint32_t slots = 0;
-   for (int s = 0; s < ns; s++) {
-      int slot = rnd(st->stage[s * 7 + 5][0]);
-      if (slot >= 0 && slot < GX_MAX_SLOTS) slots |= 1u << slot;
-   }
+   uint32_t slots = state_slots(st);
    EMIT("#version 420 core\n"
         "layout(location = 0) in vec4 vC0; layout(location = 1) in vec4 vC1;\n"
         "layout(location = 2) in vec4 vT0; layout(location = 3) in vec4 vT1;\n"
@@ -660,7 +688,22 @@ static int spec_source(const GxState *st, char *out, int cap)
         "float pk(vec3 c, int n) { vec3 q = floor(c * 255.0 + 0.5); return n == 1 ? q.r : (n == 2 ? q.g * 256.0 + q.r : q.b * 65536.0 + q.g * 256.0 + q.r); }\n"
         "void main() {\n"
         "  vec4 p = uRegs[0], r0 = uRegs[1], r1 = uRegs[2], r2 = uRegs[3];\n"
-        "  vec4 t, r; vec3 kc, rc; float ka, ra;\n");
+        "  vec4 t, r; vec3 kc, rc; float ka, ra;\n"
+        "  vec2 icPrev = vec2(0.0);\n");
+   // indirect lookups: (s, t, u) = alpha, blue, green of the indirect map, 0..255
+   uint32_t indDone = 0;
+   for (int s = 0; s < ns; s++) {
+      if (!stage_indirect(st, s) || !st->indMtx[s]) continue;
+      int i = st->indStage[s] & 3;
+      if (indDone & (1u << i)) continue;
+      indDone |= 1u << i;
+      int c = st->indCoord[i] & 3, m = st->indMap[i] & 7;
+      static const char *const wr[3] = {"clamp(c, ivec2(0), sz - 1)", "((c %% sz) + sz) %% sz", "((c %% (2 * sz)) + 2 * sz) %% (2 * sz)"};
+      EMIT("  vec3 ind%d;\n  { ivec2 sz = textureSize(uTex%d, 0); ivec2 c = ivec2(floor(vT%d.xy / (abs(vT%d.z) < 1e-6 ? 1.0 : vT%d.z) * vec2(sz)));\n", i, m, c, c, c);
+      int ws = st->tex[m].wrapS < 3 ? st->tex[m].wrapS : 0, wt = st->tex[m].wrapT < 3 ? st->tex[m].wrapT : 0;
+      EMIT("    ivec2 cs = "); EMIT(wr[ws]); EMIT(", ct = "); EMIT(wr[wt]); EMIT(";\n");
+      EMIT("    vec4 v = floor(texelFetch(uTex%d, ivec2(cs.x, ct.y), 0) * 255.0 + 0.5); ind%d = vec3(v.a, v.b, v.g); }\n", m, i);
+   }
    for (int s = 0; s < ns; s++) {
       const float(*q)[4] = &st->stage[s * 7];
       int ci[4], ai[4];
@@ -669,7 +712,36 @@ static int spec_source(const GxState *st, char *out, int cap)
       int slot = rnd(q[5][0]), coord = rnd(q[5][1]), chan = rnd(q[5][2]), rsw = rnd(q[5][3]) & 3, tsw = rnd(q[6][0]) & 3;
       int kcs = rnd(q[4][2]), kas = rnd(q[4][3]), oc = rnd(q[4][0]) & 3, oa = rnd(q[4][1]) & 3;
       EMIT("  // stage %d\n", s);
-      if (slot >= 0 && slot < GX_MAX_SLOTS) {
+      if (slot >= 0 && slot < GX_MAX_SLOTS && stage_indirect(st, s)) {
+         if (coord < 0 || coord > 3) coord = 0;
+         EMIT("  { vec2 sz = vec2(textureSize(uTex%d, 0));\n    vec2 tc = vT%d.xy / (abs(vT%d.z) < 1e-6 ? 1.0 : vT%d.z) * uStage[%d].yz * sz;\n",
+              slot, coord, coord, coord, s * 7 + 6);
+         static const float kWrap[7] = {0, 256, 128, 64, 32, 16, 0};
+         for (int a = 0; a < 2; a++) {
+            int w = a ? st->indWrapT[s] : st->indWrapS[s];
+            char ax = a ? 'y' : 'x';
+            if (w == 6) EMIT("    tc.%c = 0.0;\n", ax);
+            else if (w >= 1 && w <= 5) EMIT("    tc.%c = mod(tc.%c, %.1f);\n", ax, ax, kWrap[w]);
+         }
+         int mtx = st->indMtx[s];
+         if (mtx >= 1 && mtx <= 3) {
+            int i = st->indStage[s] & 3, fmt = st->indFmt[s] & 3, bias = st->indBias[s];
+            static const char *const mask[4] = {"", "mod(iv, 32.0)", "mod(iv, 16.0)", "mod(iv, 8.0)"};
+            EMIT("    vec3 iv = ind%d;\n", i);
+            if (fmt) EMIT("    iv = %s;\n", mask[fmt]);
+            float bv = fmt == 0 ? -128.0f : 1.0f;
+            if (bias) EMIT("    iv += vec3(%.1f, %.1f, %.1f);\n", (bias & 1) ? bv : 0.0f, (bias & 2) ? bv : 0.0f, (bias & 4) ? bv : 0.0f);
+            const float *m = st->indM[mtx - 1];
+            float sc = 1.0f;
+            int e = st->indScale[mtx - 1];
+            for (; e > 0; e--) sc *= 2.0f;
+            for (; e < 0; e++) sc *= 0.5f;
+            EMIT("    tc += vec2(dot(vec3(%.6f, %.6f, %.6f), iv), dot(vec3(%.6f, %.6f, %.6f), iv)) * %.6f;\n", m[0], m[1], m[2], m[3],
+                 m[4], m[5], sc);
+         }
+         if (st->indAddPrev[s]) EMIT("    tc += icPrev;\n");
+         EMIT("    icPrev = tc;\n    t = swz(texture(uTex%d, tc / sz), %d); }\n", slot, tsw);
+      } else if (slot >= 0 && slot < GX_MAX_SLOTS) {
          if (coord < 0 || coord > 3) coord = 0;
          EMIT("  t = swz(texture(uTex%d, vT%d.xy / (abs(vT%d.z) < 1e-6 ? 1.0 : vT%d.z) * uStage[%d].yz), %d);\n", slot, coord, coord,
               coord, s * 7 + 6, tsw);
@@ -862,12 +934,7 @@ static void apply_state(const GxState *st)
    }
 
    // textures used by the active stages
-   int n = (int)st->misc[0][0];
-   uint32_t used = 0;
-   for (int s = 0; s < n && s < GX_MAX_STAGES; s++) {
-      int slot = (int)(st->stage[s * 7 + 5][0] + (st->stage[s * 7 + 5][0] < 0 ? -0.5f : 0.5f));
-      if (slot >= 0 && slot < GX_MAX_SLOTS) used |= 1u << slot;
-   }
+   uint32_t used = state_slots(st);
    for (int i = 0; i < GX_MAX_SLOTS; i++) {
       if (uSampler[i] < 0) continue;
       const GxTexKey *k = &st->tex[i];

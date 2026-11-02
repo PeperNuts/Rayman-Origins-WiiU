@@ -1136,12 +1136,40 @@ void wii_GXSetTevSwapModeTable(uint32_t table, uint32_t r, uint32_t g, uint32_t 
    DIRTY();
 }
 
-void wii_GXSetTevDirect(uint32_t s) { FLUSH(); }
 void wii_GXSetTevIndirect(uint32_t s, uint32_t ind, uint32_t fmt, uint32_t bias, uint32_t mtx, uint32_t ws, uint32_t wt,
-                          int addPrev, int utcLod, uint32_t alphaSel) { FLUSH(); }
-void wii_GXSetNumIndStages(uint8_t n) { FLUSH(); }
-void wii_GXSetIndTexOrder(uint32_t s, uint32_t coord, uint32_t map) { FLUSH(); }
-void wii_GXSetIndTexMtx(uint32_t id, const float *m, int8_t scale) { FLUSH(); }
+                          int addPrev, int utcLod, uint32_t alphaSel)
+{
+   FLUSH();
+   if (s >= GX_MAX_STAGES) return;
+   sCur.indStage[s] = (uint8_t)(ind & 3); sCur.indFmt[s] = (uint8_t)(fmt & 3); sCur.indBias[s] = (uint8_t)(bias & 7);
+   sCur.indMtx[s] = (uint8_t)(mtx & 15); sCur.indWrapS[s] = (uint8_t)(ws & 7); sCur.indWrapT[s] = (uint8_t)(wt & 7);
+   sCur.indAddPrev[s] = addPrev != 0;
+   static int n;
+   if (n++ < 8) WHBLogPrintf("[ind] tev %u: ind %u fmt %u bias %u mtx %u wrap %u/%u add %d", (unsigned)s, (unsigned)ind, (unsigned)fmt,
+                             (unsigned)bias, (unsigned)mtx, (unsigned)ws, (unsigned)wt, addPrev);
+   DIRTY();
+}
+void wii_GXSetTevDirect(uint32_t s) { wii_GXSetTevIndirect(s, 0, 0, 0, 0, 0, 0, 0, 0, 0); }
+void wii_GXSetNumIndStages(uint8_t n) { FLUSH(); sCur.numInd = n & 7; DIRTY(); }
+void wii_GXSetIndTexOrder(uint32_t s, uint32_t coord, uint32_t map)
+{
+   FLUSH();
+   if (s >= 4) return;
+   sCur.indCoord[s] = (uint8_t)(coord & 7); sCur.indMap[s] = (uint8_t)(map & 7);
+   DIRTY();
+}
+void wii_GXSetIndTexMtx(uint32_t id, const float *m, int8_t scale)
+{
+   FLUSH();
+   uint32_t i = id >= 1 && id <= 3 ? id - 1 : 9; // only the static matrices
+   if (i < 3) {
+      for (int k = 0; k < 6; k++) sCur.indM[i][k] = m[k];
+      sCur.indScale[i] = scale;
+      static int n;
+      if (n++ < 4) WHBLogPrintf("[ind] mtx %u: %.4f %.4f %.4f / %.4f %.4f %.4f scale %d", (unsigned)id, m[0], m[1], m[2], m[3], m[4], m[5], scale);
+   }
+   DIRTY();
+}
 
 void wii_GXSetAlphaCompare(uint32_t c0, uint8_t r0, uint32_t op, uint32_t c1, uint8_t r1)
 {

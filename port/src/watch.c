@@ -95,6 +95,33 @@ static void log_thread_stack(const char *tag, OSThread *t)
 
 static void log_line(const char *l) { WHBLogPrintf("  %s", l); }
 
+uint32_t port_prof_take(uint32_t *keys, uint32_t *hits, uint32_t *lrs, int max, int *n, OSThread **thr,
+                        uint32_t *thrHits, int *nthr);
+
+// Where CPU1 spent the last 10 seconds.
+static void prof_report(void)
+{
+   static uint32_t keys[24], hits[24], lrs[24], thrHits[24];
+   static OSThread *thr[24];
+   int n, nt;
+   uint32_t total = port_prof_take(keys, hits, lrs, 24, &n, thr, thrHits, &nt);
+   if (!total) return;
+   WHBLogPrintf("[prof] CPU1 %u samples in 10 s, by thread:", (unsigned)total);
+   char l[200];
+   int ln = 0;
+   for (int i = 0; i < nt; i++) {
+      const char *name = thr[i] && thr[i]->name ? thr[i]->name : "?";
+      ln += snprintf(l + ln, sizeof(l) - ln, " %s %.1f%%", name, thrHits[i] * 100.0f / total);
+      if (ln > 150 || i + 1 == nt) { WHBLogPrintf("[prof] %s", l); ln = 0; }
+   }
+   for (int i = 0; i < n; i++) {
+      char a[24], b[24];
+      fmt_addr(a, sizeof(a), keys[i] << 6);
+      fmt_addr(b, sizeof(b), lrs[i]);
+      WHBLogPrintf("[prof] %5.1f%%%s (lr%s)", hits[i] * 100.0f / total, a, b);
+   }
+}
+
 static int watch_main(int argc, const char **argv)
 {
    uint32_t ticks = 0, seconds = 0, lastDistinct = 0, lastFiles = 0, quiet = 0;
@@ -112,6 +139,7 @@ static int watch_main(int argc, const char **argv)
       lastFiles = files;
       lastFrames = frames;
 
+      if (seconds % 10 == 0) prof_report();
       if (seconds <= 60 || seconds % 5 == 0) {
          describe_cpu1(buf, sizeof(buf));
          WHBLogPrintf("[watch] %us st%d calls %u funcs %u files %u frames %u gpu %u %s", (unsigned)seconds, port_stage(),

@@ -34,6 +34,12 @@ typedef struct {
    float swap[4][4];
    float misc[2][4];         // numStages, cmp0, ref0, op | cmp1, ref1, 0, 0
    GxTexKey tex[GX_MAX_SLOTS];
+   // Indirect texturing (configuration, baked into specialised shaders)
+   uint8_t indStage[GX_MAX_STAGES], indFmt[GX_MAX_STAGES], indBias[GX_MAX_STAGES], indMtx[GX_MAX_STAGES];
+   uint8_t indWrapS[GX_MAX_STAGES], indWrapT[GX_MAX_STAGES], indAddPrev[GX_MAX_STAGES];
+   uint8_t indCoord[4], indMap[4], numInd, indPad[3];
+   float indM[3][6];
+   int32_t indScale[3];
    uint8_t blendType, blendSrc, blendDst, logicOp;
    uint8_t colorUpdate, alphaUpdate, zEnable, zFunc, zUpdate, cull;
    uint8_t pad[2];
