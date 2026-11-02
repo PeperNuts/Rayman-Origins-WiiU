@@ -5,7 +5,7 @@ CPU's write-gather pipe collects the stores into a stream. CodeWarrior emits the
     lis  rX, 0xCC01            (patched to: lis rX, wii_gx_wgp_window@ha)
     stb/sth/stw/stfs rS, -0x8000(rX)
 This post-link pass rewrites every such store into a branch to a per-site trampoline:
-    stw   rA, port_wgp_save(r13)
+    stw   rA, port_wgp_save(r13)        (stfs: via an aligned slot, stored byte by byte)
     lwz   rA, port_wgp_ptr(r13)
     <st>  rS, 0(rA)
     addi  rA, rA, <size>
@@ -33,7 +33,9 @@ for l in subprocess.run([nm, elf], capture_output=True, text=True, check=True).s
 window, sda = syms['wii_gx_wgp_window'], syms['_SDA_BASE_']
 tramp, tramp_end = syms['port_wgp_tramp'], syms['port_wgp_tramp_end']
 off_ptr, off_save = syms['port_wgp_ptr'] - sda, syms['port_wgp_save'] - sda
-assert -0x8000 <= off_ptr < 0x8000 and -0x8000 <= off_save < 0x8000, 'wgp vars out of r13 range'
+off_save2, off_tmp = syms['port_wgp_save2'] - sda, syms['port_wgp_tmp'] - sda
+for o in (off_ptr, off_save, off_save2, off_tmp):
+    assert -0x8000 <= o < 0x8000, 'wgp vars out of r13 range'
 ha = ((window + 0x8000) >> 16) & 0xFFFF
 
 # .text address and file offset
@@ -63,8 +65,8 @@ for l in dis.splitlines():
     if m and m.group(4) in lisregs:
         sites.append((int(m.group(1), 16), m.group(2)))
 
-TRAMP_WORDS = 7
-need = len(sites) * TRAMP_WORDS * 4
+TRAMP_WORDS, FLOAT_WORDS = 7, 18
+need = sum((FLOAT_WORDS if op == 'stfs' else TRAMP_WORDS) * 4 for _, op in sites)
 assert need <= tramp_end - tramp, f'trampoline area too small: need {need}, have {tramp_end - tramp}'
 
 data = bytearray(open(elf, 'rb').read())
@@ -86,26 +88,51 @@ def branch(src, dst):
     return (18 << 26) | (d & 0x03FFFFFC)
 
 
+def D(o):
+    return o & 0xFFFF
+
+
 t = tramp
 for addr, op in sites:
     w = word(addr)
     prim, size = SIZES[op]
     assert w >> 26 == prim and (w & 0xFFFF) == 0x8000, hex(addr)
     rs = (w >> 21) & 31
-    ra = 11 if (op != 'stfs' and rs == 12) else 12
-    seq = [
-        (36 << 26) | (ra << 21) | (13 << 16) | (off_save & 0xFFFF),   # stw  rA, save(r13)
-        (32 << 26) | (ra << 21) | (13 << 16) | (off_ptr & 0xFFFF),    # lwz  rA, ptr(r13)
-        (prim << 26) | (rs << 21) | (ra << 16),                       # st   rS, 0(rA)
-        (14 << 26) | (ra << 21) | (ra << 16) | size,                  # addi rA, rA, size
-        (36 << 26) | (ra << 21) | (13 << 16) | (off_ptr & 0xFFFF),    # stw  rA, ptr(r13)
-        (32 << 26) | (ra << 21) | (13 << 16) | (off_save & 0xFFFF),   # lwz  rA, save(r13)
-    ]
-    for i, s in enumerate(seq):
-        put(t + 4 * i, s)
-    put(t + 24, branch(t + 24, addr + 4))
+    if op == 'stfs':
+        # Floating-point stores must be word-aligned on Espresso (an unaligned stfs raises an
+        # alignment exception); the stream is byte-granular, so go through an aligned slot
+        # and store the four bytes individually.
+        rot = (21 << 26) | (11 << 21) | (11 << 16) | (8 << 11) | (0 << 6) | (31 << 1)  # rotlwi r11,r11,8
+        seq = [
+            (36 << 26) | (12 << 21) | (13 << 16) | D(off_save),    # stw  r12, save(r13)
+            (36 << 26) | (11 << 21) | (13 << 16) | D(off_save2),   # stw  r11, save2(r13)
+            (52 << 26) | (rs << 21) | (13 << 16) | D(off_tmp),     # stfs fS, tmp(r13)
+            (32 << 26) | (11 << 21) | (13 << 16) | D(off_tmp),     # lwz  r11, tmp(r13)
+            (32 << 26) | (12 << 21) | (13 << 16) | D(off_ptr),     # lwz  r12, ptr(r13)
+        ]
+        for i in range(4):
+            seq += [rot, (38 << 26) | (11 << 21) | (12 << 16) | i]  # rotlwi; stb r11, i(r12)
+        seq += [
+            (14 << 26) | (12 << 21) | (12 << 16) | 4,              # addi r12, r12, 4
+            (36 << 26) | (12 << 21) | (13 << 16) | D(off_ptr),     # stw  r12, ptr(r13)
+            (32 << 26) | (11 << 21) | (13 << 16) | D(off_save2),   # lwz  r11, save2(r13)
+            (32 << 26) | (12 << 21) | (13 << 16) | D(off_save),    # lwz  r12, save(r13)
+        ]
+    else:
+        ra = 11 if rs == 12 else 12
+        seq = [
+            (36 << 26) | (ra << 21) | (13 << 16) | D(off_save),    # stw  rA, save(r13)
+            (32 << 26) | (ra << 21) | (13 << 16) | D(off_ptr),     # lwz  rA, ptr(r13)
+            (prim << 26) | (rs << 21) | (ra << 16),                # st   rS, 0(rA)
+            (14 << 26) | (ra << 21) | (ra << 16) | size,           # addi rA, rA, size
+            (36 << 26) | (ra << 21) | (13 << 16) | D(off_ptr),     # stw  rA, ptr(r13)
+            (32 << 26) | (ra << 21) | (13 << 16) | D(off_save),    # lwz  rA, save(r13)
+        ]
+    for i, x in enumerate(seq):
+        put(t + 4 * i, x)
+    put(t + 4 * len(seq), branch(t + 4 * len(seq), addr + 4))
     put(addr, branch(addr, t))
-    t += TRAMP_WORDS * 4
+    t += 4 * (len(seq) + 1)
 
 open(elf, 'wb').write(data)
 print(f'wgp: patched {len(sites)} FIFO stores ({", ".join(f"{k} {sum(1 for _, o in sites if o == k)}" for k in SIZES)})')

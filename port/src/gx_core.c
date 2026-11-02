@@ -553,6 +553,7 @@ void wii_GXBegin(uint32_t prim, uint32_t fmt, uint16_t n)
    FLUSH();
    TRACE_N(8, "[gx] GXBegin %02X fmt %u n %u at %p (mode %d)", (unsigned)prim, (unsigned)fmt, (unsigned)n, port_wgp_ptr, sMode);
    uint8_t *p = port_wgp_ptr;
+   while (((uint32_t)p + 3) & 3) *p++ = 0; // GX NOPs so the vertex data starts word-aligned
    p[0] = (uint8_t)(prim | (fmt & 7));
    p[1] = (uint8_t)(n >> 8);
    p[2] = (uint8_t)n;
