@@ -454,6 +454,26 @@ static const uint8_t kDstBlend[8] = {GX2_BLEND_MODE_ZERO, GX2_BLEND_MODE_ONE, GX
                                      GX2_BLEND_MODE_INV_DST_ALPHA};
 static const uint8_t kRop[16] = {0x00, 0x88, 0x44, 0xCC, 0x22, 0xAA, 0x66, 0xEE, 0x11, 0x99, 0x55, 0xDD, 0x33, 0xBB, 0x77, 0xFF};
 
+// GPU step tracing: the first few occurrences of each GPU operation are logged, given time
+// to reach the PC, executed and waited for, so a GPU hang names its culprit in the log.
+static int step_begin(const char *name, int *count)
+{
+   if (*count >= 3) return 0;
+   (*count)++;
+   WHBLogPrintf("[gpu] %s #%d ...", name, *count);
+   OSSleepTicks(OSMillisecondsToTicks(60));
+   return 1;
+}
+
+static void step_end(int traced, const char *name)
+{
+   if (!traced) return;
+   GX2DrawDone();
+   WHBLogPrintf("[gpu] %s ok", name);
+}
+
+#define STEP(name, code) do { static int _n; int _t = step_begin(name, &_n); code; step_end(_t, name); } while (0)
+
 static void bind_efb(void)
 {
    GX2SetContextState(sCtx);
@@ -558,8 +578,8 @@ static void clear_efb(uint32_t rgba, uint32_t z)
 {
    if (sCfgNoClear) return;
    gx_render_step = "clear";
-   GX2ClearColor(&sEfb, (rgba >> 24) / 255.0f, ((rgba >> 16) & 255) / 255.0f, ((rgba >> 8) & 255) / 255.0f, (rgba & 255) / 255.0f);
-   GX2ClearDepthStencilEx(&sEfbDepth, (z & 0xFFFFFF) / 16777215.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
+   STEP("clear colour", GX2ClearColor(&sEfb, (rgba >> 24) / 255.0f, ((rgba >> 16) & 255) / 255.0f, ((rgba >> 8) & 255) / 255.0f, (rgba & 255) / 255.0f));
+   STEP("clear depth", GX2ClearDepthStencilEx(&sEfbDepth, (z & 0xFFFFFF) / 16777215.0f, 0, GX2_CLEAR_FLAGS_DEPTH));
 }
 
 static void copy_tex(const GxCmd *c)
@@ -575,7 +595,7 @@ static void copy_tex(const GxCmd *c)
       GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, sEfb.surface.image, sEfb.surface.imageSize);
       GX2Rect r = {(int32_t)(l * EFB_SCALE), (int32_t)(t * EFB_SCALE), (int32_t)((l + w) * EFB_SCALE), (int32_t)((t + h) * EFB_SCALE)};
       GX2Point pt = {0, 0};
-      GX2CopySurfaceEx(&sEfb.surface, 0, 0, &dst->surface, 0, 0, 1, &r, &pt);
+      STEP("copy EFB to texture", GX2CopySurfaceEx(&sEfb.surface, 0, 0, &dst->surface, 0, 0, 1, &r, &pt));
       GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, dst->surface.image, dst->surface.imageSize);
    }
    if (c->a[4]) clear_efb(c->a[5], c->a[6]);
@@ -589,7 +609,7 @@ static void play(GxPacket *pk)
    gx_render_step = "play";
    DCFlushRange(pk->verts, pk->numVerts * sizeof(GxVertex));
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, pk->verts, pk->numVerts * sizeof(GxVertex));
-   bind_efb();
+   STEP("bind EFB", bind_efb());
    GX2SetAttribBuffer(0, pk->numVerts * sizeof(GxVertex), sizeof(GxVertex), pk->verts);
    uint32_t cur = 0xFFFFFFFF, draws = 0;
    for (uint32_t i = 0; i < pk->numCmds; i++) {
@@ -597,10 +617,10 @@ static void play(GxPacket *pk)
       switch (c->type) {
       case GXCMD_DRAW:
          if (!c->count) break;
-         if (c->state != cur) { apply_state(&pk->states[c->state]); cur = c->state; }
+         if (c->state != cur) { STEP("apply state", apply_state(&pk->states[c->state])); cur = c->state; }
          if (c->first + c->count > pk->numVerts) break;
          gx_render_step = "draw";
-         if (!sCfgNoDraw) GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1);
+         if (!sCfgNoDraw) STEP("draw", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1));
          draws++;
          break;
       case GXCMD_COPYTEX:
@@ -756,7 +776,7 @@ static int render_main(int argc, const char **argv)
       WHBGfxBeginRenderTV();
       uint32_t cc = pk->clearColor;
       if (pk->black) WHBGfxClearColor(0, 0, 0, 1);
-      else if (sHaveShaders) present_tv(pk);
+      else if (sHaveShaders) STEP("present EFB to TV", present_tv(pk));
       else WHBGfxClearColor((cc >> 24) / 255.0f, ((cc >> 16) & 255) / 255.0f, ((cc >> 8) & 255) / 255.0f, 1.0f);
       port_blit(&strip, &tv->surface, 0, (int)tv->surface.height - (int)strip.height);
       WHBGfxFinishRenderTV();
@@ -765,7 +785,8 @@ static int render_main(int argc, const char **argv)
       port_blit(&pad, &drc->surface, 0, 0);
       WHBGfxFinishRenderDRC();
       gx_render_step = "finish";
-      WHBGfxFinishRender(); // swaps, waits for the GPU and the flip
+      if (sHaveShaders) STEP("finish frame", WHBGfxFinishRender()); // swaps, waits for the GPU and the flip
+      else WHBGfxFinishRender();
       gx_render_step = "idle";
 
       if (sHaveShaders && pk->clearAfter) {
