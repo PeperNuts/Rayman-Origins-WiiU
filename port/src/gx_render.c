@@ -174,8 +174,14 @@ static int glsl_init(void)
    OSDynLoad_Module m;
    OSTime t0 = OSGetSystemTime();
    WHBLogPrintf("[gfx] loading glslcompiler.rpl");
-   if (OSDynLoad_Acquire("glslcompiler", &m) != OS_DYNLOAD_OK &&
-       OSDynLoad_Acquire("~/wiiu/libs/glslcompiler.rpl", &m) != OS_DYNLOAD_OK) {
+   OSDynLoad_Error e = OSDynLoad_Acquire("glslcompiler", &m);
+   WHBLogPrintf("[gfx] OSDynLoad_Acquire(glslcompiler) = %d (%u ms)", (int)e, (unsigned)OSTicksToMilliseconds(OSGetSystemTime() - t0));
+   if (e != OS_DYNLOAD_OK) {
+      e = OSDynLoad_Acquire("~/wiiu/libs/glslcompiler.rpl", &m);
+      WHBLogPrintf("[gfx] OSDynLoad_Acquire(~/wiiu/libs/glslcompiler.rpl) = %d (%u ms)", (int)e,
+                   (unsigned)OSTicksToMilliseconds(OSGetSystemTime() - t0));
+   }
+   if (e != OS_DYNLOAD_OK) {
       WHBLogPrintf("[gfx] glslcompiler.rpl not found - copy it to sd:/wiiu/libs/");
       return 0;
    }
@@ -285,10 +291,14 @@ static int init_targets(void)
    return s->image && d->image && sCtx && sBlitVerts;
 }
 
-static int init_shaders(void)
+static int compile_shaders(void)
 {
-   if (!glsl_init()) return 0;
-   if (!compile(&sTev, kTevVS, kTevPS, "TEV") || !compile(&sBlit, kBlitVS, kBlitPS, "blit")) return 0;
+   return compile(&sTev, kTevVS, kTevPS, "TEV") && compile(&sBlit, kBlitVS, kBlitPS, "blit");
+}
+
+// Fetch shaders and uniform locations: GX2 work, done on the render thread.
+static int finish_shaders(void)
+{
    static const char *attr[7] = {"aPos", "aC0", "aC1", "aT0", "aT1", "aT2", "aT3"};
    for (int i = 0; i < 7; i++) WHBGfxInitShaderAttribute(&sTev, attr[i], 0, i * 16, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
    WHBGfxInitFetchShader(&sTev);
@@ -603,27 +613,32 @@ static void present_tv(const GxPacket *pk)
 // ---------------------------------------------------------------------------------------
 #define SHADER_STACK (8u << 20)
 static OSThread sShaderThread __attribute__((aligned(16)));
+static volatile int sGx2Up, sCompiled;
 
 static int shader_main(int argc, const char **argv)
 {
-   int ok = init_shaders();
-   if (!ok) WHBLogPrintf("[gfx] no shaders: the TV shows only the clear colour");
-   sHaveShaders = ok;
-   sShaderDone = 1;
+   sCompiled = compile_shaders();
    return 0;
 }
 
-static void start_shader_thread(void)
+// Called by main() before the game starts: loads CafeGLSL and compiles the shaders on the
+// main core while nothing else runs (dynamic loading from a busy background thread hung).
+void port_shaders_prepare(void)
 {
+   for (int i = 0; i < 500 && !sGx2Up; i++) OSSleepTicks(OSMillisecondsToTicks(10));
+   if (!glsl_init()) { sShaderDone = 1; return; } // load on the main thread itself, like CafeGLSL's samples
    uint8_t *stack = MEMAllocFromDefaultHeapEx(SHADER_STACK, 16);
-   if (!stack || !OSCreateThread(&sShaderThread, (OSThreadEntryPointFn)shader_main, 0, NULL, stack + SHADER_STACK,
-                                 SHADER_STACK, 20, OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+   if (stack && OSCreateThread(&sShaderThread, (OSThreadEntryPointFn)shader_main, 0, NULL, stack + SHADER_STACK,
+                               SHADER_STACK, 16, OS_THREAD_ATTRIB_AFFINITY_CPU1)) {
+      OSSetThreadName(&sShaderThread, "Rayman shaders");
+      OSResumeThread(&sShaderThread);
+      int ret;
+      OSJoinThread(&sShaderThread, &ret);
+   } else {
       WHBLogPrintf("[gfx] could not start the shader thread");
-      sShaderDone = 1;
-      return;
    }
-   OSSetThreadName(&sShaderThread, "Rayman shaders");
-   OSResumeThread(&sShaderThread);
+   if (!sCompiled) WHBLogPrintf("[gfx] no shaders: the TV shows only the clear colour");
+   sShaderDone = 1;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -649,7 +664,7 @@ static int render_main(int argc, const char **argv)
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, sWhite.surface.image, sWhite.surface.imageSize);
    WHBLogPrintf("[gfx] GX2 up: TV %ux%u, GamePad %ux%u, EFB %ux%u", (unsigned)tv->surface.width,
                 (unsigned)tv->surface.height, (unsigned)drc->surface.width, (unsigned)drc->surface.height, EFB_W, EFB_H);
-   start_shader_thread(); // compiles in the background; the screens keep updating meanwhile
+   sGx2Up = 1;
 
    const int padRows = (int)(drc->surface.height / 16);
    static char rows[40][PORT_LOG_COLS];
@@ -661,8 +676,14 @@ static int render_main(int argc, const char **argv)
          OSSleepTicks(OSMillisecondsToTicks(50));
          continue;
       }
+      if (sShaderDone && sCompiled && !sHaveShaders) sHaveShaders = finish_shaders();
+      static GxPacket idle = {.black = 1};
       GxPacket *pk = gx_acquire_packet();
-      if (!pk) { OSSleepTicks(OSMillisecondsToTicks(2)); continue; }
+      if (!pk) {
+         if (sShaderDone) { OSSleepTicks(OSMillisecondsToTicks(2)); continue; }
+         OSSleepTicks(OSMillisecondsToTicks(30)); // before the game starts: keep the log on screen
+         pk = &idle;
+      }
       sFrame++;
 
       if (sHaveShaders) play(pk); // the EFB clear of GXCopyDisp happens after the frame is shown (below)
@@ -700,7 +721,7 @@ static int render_main(int argc, const char **argv)
          clear_efb(pk->clearColor, pk->clearZ);
          GX2DrawDone();
       }
-      gx_release_packet(pk);
+      if (pk != &idle) gx_release_packet(pk);
 
       if (secs >= lastReport + 5) {
          lastReport = secs;

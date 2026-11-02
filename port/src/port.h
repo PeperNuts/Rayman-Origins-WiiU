@@ -40,6 +40,7 @@ void port_screen_init(void);
 void port_screen_draw(void);
 void port_screen_free(void);
 void port_render_start(void);
+void port_shaders_prepare(void);
 #define PORT_LOG_COLS 110
 int port_log_snapshot(char out[][PORT_LOG_COLS], int rows);
 struct GX2Surface;
