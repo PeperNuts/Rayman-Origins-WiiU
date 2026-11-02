@@ -1185,8 +1185,9 @@ static void video_draw(const GxPacket *pk, const GxCmd *c)
    }
    for (uint32_t i = 0; i < c->count && i < 4; i++) {
       const GxVertex *v = &pk->verts[c->first + i];
-      WHBLogPrintf("[video]   v%u pos %.1f %.1f | t0 %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f", (unsigned)i, v->pos[0], v->pos[1],
-                   v->tc[0][0], v->tc[0][1], v->tc[0][2], v->tc[1][0], v->tc[1][1], v->tc[2][0], v->tc[2][1]);
+      WHBLogPrintf("[video]   v%u pos %.1f %.1f | t0 %.3f %.3f %.3f t1 %.3f %.3f t2 %.3f %.3f t3 %.3f %.3f %.3f", (unsigned)i, v->pos[0],
+                   v->pos[1], v->tc[0][0], v->tc[0][1], v->tc[0][2], v->tc[1][0], v->tc[1][1], v->tc[2][0], v->tc[2][1], v->tc[3][0],
+                   v->tc[3][1], v->tc[3][2]);
    }
 }
 

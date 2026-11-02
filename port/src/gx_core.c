@@ -349,7 +349,7 @@ static void mtx_apply(const float *m, const float v[4], float out[3], int rows)
    for (int r = 0; r < rows; r++) out[r] = m[r * 4] * v[0] + m[r * 4 + 1] * v[1] + m[r * 4 + 2] * v[2] + m[r * 4 + 3] * v[3];
 }
 
-static void decode_vertex(int fmt, const uint8_t **pp, GxVertex *o)
+static __attribute__((unused)) void decode_vertex(int fmt, const uint8_t **pp, GxVertex *o)
 {
    const uint8_t *p = *pp;
    uint32_t pm = G.curPosMtx;
@@ -431,6 +431,162 @@ static void decode_vertex(int fmt, const uint8_t **pp, GxVertex *o)
    }
 }
 
+static void texgen_general(GxVertex *o, const float pos[4], float tex[8][2], const int tmIdx[8])
+{
+   // texture coordinate generation
+   for (uint32_t i = 0; i < GX_MAX_COORDS; i++) {
+      float *tc = o->tc[i];
+      tc[0] = tc[1] = 0; tc[2] = 1; tc[3] = 0;
+      if (i >= G.numTexGens) continue;
+      const TexGen *tg = &G.texGen[i];
+      float in[4] = {0, 0, 1, 1};
+      if (tg->src >= 4 && tg->src <= 11) { in[0] = tex[tg->src - 4][0]; in[1] = tex[tg->src - 4][1]; }
+      else if (tg->src == 0) { in[0] = pos[0]; in[1] = pos[1]; in[2] = pos[2]; }
+      else if (tg->src == 19 || tg->src == 20) { in[0] = o->c0[0]; in[1] = o->c0[1]; }
+      else continue;
+      int mtx = tmIdx[i] >= 0 ? tmIdx[i] : tg->mtx;
+      float r[3] = {in[0], in[1], 1.0f};
+      if (tg->func <= 1 && mtx >= 30 && mtx < 60) {
+         mtx_apply(G.texMtx[(mtx - 30) / 3], in, r, tg->func == 0 ? 3 : 2);
+         if (tg->func == 1) r[2] = 1.0f;
+      }
+      // Revolution GX always applies the dual (post) transform: optional normalisation, then
+      // a 3x4 post matrix (Bink scales its texel-space coordinates this way).
+      if (tg->post != 125 && tg->post >= 64 && tg->post < 124) {
+         if (tg->normalize) {
+            float l = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+            if (l > 0) { r[0] /= l; r[1] /= l; r[2] /= l; }
+         }
+         float v[4] = {r[0], r[1], r[2], 1.0f};
+         mtx_apply(G.postMtx[(tg->post - 64) / 3], v, r, 3);
+      }
+      tc[0] = r[0]; tc[1] = r[1]; tc[2] = r[2];
+   }
+}
+
+// ---------------------------------------------------------------------------------------
+// Fast vertex decoding: the vertex format is turned into a short plan once per primitive,
+// so each vertex only walks the attributes that are present.
+// ---------------------------------------------------------------------------------------
+typedef struct {
+   uint8_t attr, mode, type, cnt, csize;
+   uint16_t dsize;
+   float scale;
+   const uint8_t *array;
+   uint32_t stride;
+} Step;
+
+typedef struct {
+   int pnmtx;                // PNMTXIDX present
+   int ntm, tm[8];           // texture-matrix index attributes present (texgen slots)
+   int nsteps;
+   Step st[12];
+   int general;              // texgen needs the full path
+   int ncoords;              // texgens to produce (<= GX_MAX_COORDS)
+   int copySrc[GX_MAX_COORDS]; // fast path: texcoord = TEXn (n) or -1 = zero
+   int chans;
+} Plan;
+
+static void plan_build(int fmt, Plan *pl)
+{
+   memset(pl, 0, sizeof(*pl));
+   pl->pnmtx = G.vcd[VA_PNMTXIDX] != AT_NONE;
+   for (int i = 0; i < 8; i++)
+      if (G.vcd[VA_TEX0MTXIDX + i]) pl->tm[pl->ntm++] = i;
+   for (int a = VA_POS; a <= 20; a++) {
+      if (G.vcd[a] == AT_NONE) continue;
+      Step *s = &pl->st[pl->nsteps++];
+      const Vat *v = &G.vat[fmt][a];
+      s->attr = (uint8_t)a;
+      s->mode = G.vcd[a];
+      s->type = v->type;
+      s->cnt = v->cnt;
+      s->csize = kCompSize[v->type > 4 ? 4 : v->type];
+      s->dsize = (uint16_t)attr_direct_size(fmt, a);
+      s->scale = 1.0f / (float)(1u << v->frac);
+      s->array = G.array[a];
+      s->stride = G.stride[a];
+   }
+   pl->ncoords = G.numTexGens < GX_MAX_COORDS ? (int)G.numTexGens : GX_MAX_COORDS;
+   pl->chans = (int)G.numChans;
+   for (int i = 0; i < pl->ncoords; i++) {
+      const TexGen *tg = &G.texGen[i];
+      int idMtx = tg->mtx == 60 && (tg->post == 125 || tg->post < 64);
+      int hasTmAttr = G.vcd[VA_TEX0MTXIDX + i] != AT_NONE;
+      if (tg->func == 1 && tg->src >= 4 && tg->src <= 11 && idMtx && !hasTmAttr) pl->copySrc[i] = tg->src - 4;
+      else pl->general = 1;
+   }
+}
+
+static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
+{
+   const uint8_t *p = *pp;
+   uint32_t pm = G.curPosMtx;
+   int tmIdx[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+   if (pl->pnmtx) pm = *p++ / 3;
+   for (int i = 0; i < pl->ntm; i++) tmIdx[pl->tm[i]] = *p++;
+   float pos[4] = {0, 0, 0, 1}, clr[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}}, tex[8][2] = {{0}};
+   for (int k = 0; k < pl->nsteps; k++) {
+      const Step *s = &pl->st[k];
+      const uint8_t *src;
+      if (s->mode == AT_DIRECT) { src = p; p += s->dsize; }
+      else if (s->mode == AT_INDEX8) { src = s->array ? s->array + (uint32_t)p[0] * s->stride : NULL; p += 1; }
+      else { src = s->array ? s->array + (uint32_t)be16(p) * s->stride : NULL; p += 2; }
+      if (!src) continue;
+      switch (s->attr) {
+      case VA_POS:
+         if (s->type == CT_F32) {
+            pos[0] = bef(src); pos[1] = bef(src + 4);
+            if (s->cnt) pos[2] = bef(src + 8);
+         } else {
+            pos[0] = comp(src, s->type, s->scale); pos[1] = comp(src + s->csize, s->type, s->scale);
+            if (s->cnt) pos[2] = comp(src + 2 * s->csize, s->type, s->scale);
+         }
+         break;
+      case VA_CLR0: case VA_CLR1:
+         read_color(src, s->type, clr[s->attr - VA_CLR0]);
+         break;
+      case VA_NRM:
+         break;
+      default: {
+         int t = s->attr - VA_TEX0;
+         if (s->type == CT_F32) { tex[t][0] = bef(src); if (s->cnt) tex[t][1] = bef(src + 4); }
+         else { tex[t][0] = comp(src, s->type, s->scale); if (s->cnt) tex[t][1] = comp(src + s->csize, s->type, s->scale); }
+         break;
+      }
+      }
+   }
+   *pp = p;
+   if (pm > 9) pm = 0;
+   const float *m = G.posMtx[pm];
+   o->pos[0] = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
+   o->pos[1] = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7];
+   o->pos[2] = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
+   o->pos[3] = 1.0f;
+   for (int c = 0; c < 2; c++) {
+      float *out = c ? o->c1 : o->c0;
+      if (c >= pl->chans) { out[0] = out[1] = out[2] = out[3] = 0; continue; }
+      const ChanCtrl *cc = &G.chan[c * 2], *ac = &G.chan[c * 2 + 1];
+      for (int k = 0; k < 4; k++) {
+         const ChanCtrl *ctl = k < 3 ? cc : ac;
+         float v = ctl->matSrc ? clr[c][k] : G.mat[c][k];
+         if (ctl->enable) v *= ctl->ambSrc ? clr[c][k] : G.amb[c][k];
+         out[k] = v;
+      }
+   }
+   if (!pl->general) {
+      for (int i = 0; i < GX_MAX_COORDS; i++) {
+         float *tc = o->tc[i];
+         if (i < pl->ncoords) { tc[0] = tex[pl->copySrc[i]][0]; tc[1] = tex[pl->copySrc[i]][1]; }
+         else { tc[0] = tc[1] = 0; }
+         tc[2] = 1; tc[3] = 0;
+      }
+      return;
+   }
+   texgen_general(o, pos, tex, tmIdx);
+}
+
+
 // ---------------------------------------------------------------------------------------
 // Primitives -> triangle lists in the packet
 // ---------------------------------------------------------------------------------------
@@ -458,6 +614,7 @@ static void push_state(void)
 // its first decoded vertex, so invisible objects can be traced to their state.
 // ---------------------------------------------------------------------------------------
 static int sParseFromDL;
+static int sCensus = -1;
 volatile uint32_t gx_nan_verts;
 
 static uint32_t fnv(uint32_t h, const void *p, uint32_t n)
@@ -469,6 +626,8 @@ static uint32_t fnv(uint32_t h, const void *p, uint32_t n)
 
 static void census(int fmt, const GxVertex *v)
 {
+   if (sCensus < 0) sCensus = port_cfg("census");
+   if (!sCensus) return;
    static uint32_t seen[96];
    static int nseen;
    if (nseen >= 96) return;
@@ -519,6 +678,28 @@ static void census(int fmt, const GxVertex *v)
 
 static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
 {
+   static Plan plan;
+   plan_build(fmt, &plan);
+   static int sTgLog;
+   if (G.numTexGens >= 4 && sTgLog < 4) {
+      sTgLog++;
+      WHBLogPrintf("[texgen] %u gens, fmt %d, vcd tex %u %u %u %u mtxidx %u %u %u %u", (unsigned)G.numTexGens, fmt, G.vcd[VA_TEX0],
+                   G.vcd[VA_TEX0 + 1], G.vcd[VA_TEX0 + 2], G.vcd[VA_TEX0 + 3], G.vcd[VA_TEX0MTXIDX], G.vcd[VA_TEX0MTXIDX + 1],
+                   G.vcd[VA_TEX0MTXIDX + 2], G.vcd[VA_TEX0MTXIDX + 3]);
+      for (int i = 0; i < 4; i++) {
+         const TexGen *tg = &G.texGen[i];
+         const float *m = tg->mtx >= 30 && tg->mtx < 60 ? G.texMtx[(tg->mtx - 30) / 3] : NULL;
+         const float *q = tg->post >= 64 && tg->post < 124 ? G.postMtx[(tg->post - 64) / 3] : NULL;
+         WHBLogPrintf("[texgen]  %d: func %u src %u mtx %u post %u norm %u | m %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f | p %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f",
+                      i, tg->func, tg->src, tg->mtx, tg->post, tg->normalize, m ? m[0] : 0, m ? m[1] : 0, m ? m[2] : 0, m ? m[3] : 0,
+                      m ? m[4] : 0, m ? m[5] : 0, m ? m[6] : 0, m ? m[7] : 0, q ? q[0] : 0, q ? q[1] : 0, q ? q[2] : 0, q ? q[3] : 0,
+                      q ? q[4] : 0, q ? q[5] : 0, q ? q[6] : 0, q ? q[7] : 0);
+      }
+      for (int a = VA_TEX0; a < VA_TEX0 + 4; a++) {
+         const Vat *v = &G.vat[fmt][a];
+         if (G.vcd[a]) WHBLogPrintf("[texgen]  attr tex%d: type %u cnt %u frac %u", a - VA_TEX0, v->type, v->cnt, v->frac);
+      }
+   }
    TRACE_N(8, "[gx] prim %02X fmt %d n %u vsize %u data %p", prim, fmt, (unsigned)n, (unsigned)vertex_size(fmt), data);
    GxPacket *pk = sFill;
    uint32_t need;
@@ -548,12 +729,12 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
    uint32_t emitted = 0;
    for (uint32_t i = 0; i < n; i++) {
       GxVertex v;
-      decode_vertex(fmt, &p, &v);
+      decode_fast(&plan, &p, &v);
       if (v.pos[0] != v.pos[0] || v.pos[1] != v.pos[1] || v.pos[2] != v.pos[2]) { // NaN: collapse (invisible)
          v.pos[0] = v.pos[1] = v.pos[2] = 0;
          gx_nan_verts++;
       }
-      if (i == 0) census(fmt, &v);
+      if (i == 0 && sCensus) census(fmt, &v);
       switch (prim) {
       case 0x80: case 0x88: // quads
          switch (i & 3) {
