@@ -339,10 +339,20 @@ static int finish_shaders(void)
       WHBLogPrintf("[gfx]   ps block '%s' location %u size %u", ps->uniformBlocks[i].name, (unsigned)ps->uniformBlocks[i].offset,
                    (unsigned)ps->uniformBlocks[i].size);
    if (sBlockMode) {
-      // Uniform-block mode: offsets are byte offsets inside the (single) block of each stage.
+      // Uniform-block mode. CafeGLSL v0.2 reports mode 1 without declaring a block: loose
+      // uniforms live in an implicit block at location 0, at byte offsets.
       if (vs->uniformBlockCount) { sVsBlockLoc = vs->uniformBlocks[0].offset; sVsBlockSize = vs->uniformBlocks[0].size; }
+      else { sVsBlockLoc = 0; sVsBlockSize = (uint32_t)(uProj >= 0 ? uProj : 0) + 64; }
       if (ps->uniformBlockCount) { sPsBlockLoc = ps->uniformBlocks[0].offset; sPsBlockSize = ps->uniformBlocks[0].size; }
-      sUboSwap = !port_cfg("ubonoswap");
+      else {
+         int32_t end = 0, offs[5] = {uStage, uRegs, uKonst, uSwap, uMisc};
+         int32_t sizes[5] = {GX_MAX_STAGES * 7 * 16, 64, 64, 64, 32};
+         for (int i = 0; i < 5; i++)
+            if (offs[i] >= 0 && offs[i] + sizes[i] > end) end = offs[i] + sizes[i];
+         sPsBlockLoc = 0;
+         sPsBlockSize = (uint32_t)end;
+      }
+      sUboSwap = port_cfg("uboswap"); // GPU reads blocks 8-in-32 swapped, like vertex data
       sUbo = MEMAllocFromDefaultHeapEx(UBO_RING, 256);
       WHBLogPrintf("[gfx] uniform blocks: vs loc %d size %u, ps loc %d size %u, byte swap %d", (int)sVsBlockLoc,
                    (unsigned)sVsBlockSize, (int)sPsBlockLoc, (unsigned)sPsBlockSize, sUboSwap);
