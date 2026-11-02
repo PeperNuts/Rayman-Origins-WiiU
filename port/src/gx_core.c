@@ -512,7 +512,9 @@ static void flush(void)
       gx_in_flush = 0;
       return;
    }
-   const uint8_t *stop = parse(sParse, end);
+   static int noDecode = -1;
+   if (noDecode < 0) noDecode = port_cfg("nodecode");
+   const uint8_t *stop = noDecode ? end : parse(sParse, end);
    if (stop == end) {
       sParse = port_wgp_ptr = sFifo;
    } else {
@@ -982,8 +984,9 @@ int gx_describe(char *buf, int size)
 {
    extern uint8_t *volatile port_wgp_ptr;
    static const char *modes[3] = {"fifo", "dl", "redirect"};
-   return snprintf(buf, size, "gx: last %s, %u calls, %u flushes%s, mode %s, stream %d bytes, prims %u, pkts %u",
-                   (const char *)gx_last_api, (unsigned)gx_api_calls, (unsigned)gx_flushes, gx_in_flush ? " (IN FLUSH)" : "",
+   extern volatile const char *gx_render_step;
+   return snprintf(buf, size, "gx: render %s, last %s, %u calls, %u flushes%s, mode %s, stream %d bytes, prims %u, pkts %u",
+                   (const char *)gx_render_step, (const char *)gx_last_api, (unsigned)gx_api_calls, (unsigned)gx_flushes, gx_in_flush ? " (IN FLUSH)" : "",
                    modes[sMode < 3 ? sMode : 0], sMode == MODE_FIFO ? (int)(port_wgp_ptr - sParse) : -1,
                    (unsigned)sStats[0], (unsigned)sStats[4]);
 }

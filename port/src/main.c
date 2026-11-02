@@ -19,7 +19,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 22"
+#define PORT_VERSION "first-boot 23"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -102,6 +102,28 @@ static int game_thread(int argc, const char **argv)
    sStage = 3;
    WHBLogPrintf("[boot] game main() returned %d", ret);
    return ret;
+}
+
+// sd:/rayman/port.cfg: words that switch features off for testing (e.g. "noefb nocopy").
+static char sCfg[256];
+int port_cfg(const char *word)
+{
+   static int loaded;
+   if (!loaded) {
+      loaded = 1;
+      FILE *f = fopen("fs:/vol/external01/rayman/port.cfg", "r");
+      if (f) {
+         size_t n = fread(sCfg, 1, sizeof(sCfg) - 1, f);
+         sCfg[n] = 0;
+         fclose(f);
+      }
+   }
+   size_t len = strlen(word);
+   for (const char *p = sCfg; (p = strstr(p, word)); p += len) {
+      char after = p[len];
+      if ((p == sCfg || p[-1] <= ' ' || p[-1] == ',') && (after <= ' ' || after == ',')) return 1;
+   }
+   return 0;
 }
 
 int main(int argc, char **argv)

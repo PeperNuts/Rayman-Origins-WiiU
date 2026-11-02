@@ -38,6 +38,10 @@
 #define EFB_W (640 * EFB_SCALE)
 #define EFB_H (528 * EFB_SCALE)
 
+// Switches read from sd:/rayman/port.cfg (to bisect GPU problems without new builds)
+static int sCfgNoEfb, sCfgNoClear, sCfgNoCopy, sCfgNoDraw;
+volatile const char *gx_render_step = "init"; // breadcrumb for the watchdog
+
 // ---------------------------------------------------------------------------------------
 // Shaders
 // ---------------------------------------------------------------------------------------
@@ -363,7 +367,7 @@ static uint32_t content_hash(const GxTexKey *k)
    return h;
 }
 
-static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile)
+static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile, uint32_t use)
 {
    memset(t, 0, sizeof(*t));
    GX2Surface *s = &t->surface;
@@ -371,7 +375,7 @@ static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile)
    s->width = w; s->height = h; s->depth = 1; s->mipLevels = 1;
    s->format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
    s->aa = GX2_AA_MODE1X;
-   s->use = GX2_SURFACE_USE_TEXTURE;
+   s->use = (GX2SurfaceUse)use;
    s->tileMode = tile;
    t->viewNumMips = 1;
    t->viewNumSlices = 1;
@@ -425,7 +429,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
    if (sNumTex >= MAX_TEX) return &sWhite;
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
-   if (!make_texture(&e->tex, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED)) return &sWhite;
+   if (!make_texture(&e->tex, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) return &sWhite;
    gx_decode_texture(k, (uint32_t *)e->tex.surface.image, e->tex.surface.pitch);
    DCFlushRange(e->tex.surface.image, e->tex.surface.imageSize);
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, e->tex.surface.image, e->tex.surface.imageSize);
@@ -540,7 +544,7 @@ static GX2Texture *render_texture(uint32_t dest, uint32_t w, uint32_t h)
    if (sNumTex >= MAX_TEX) return NULL;
    e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
-   if (!make_texture(&e->tex, w, h, GX2_TILE_MODE_DEFAULT)) return NULL;
+   if (!make_texture(&e->tex, w, h, GX2_TILE_MODE_DEFAULT, GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER)) return NULL;
    e->key.image = dest;
    e->render = 1;
    e->bytes = e->tex.surface.imageSize;
@@ -552,14 +556,20 @@ static GX2Texture *render_texture(uint32_t dest, uint32_t w, uint32_t h)
 
 static void clear_efb(uint32_t rgba, uint32_t z)
 {
-   GX2ClearBuffersEx(&sEfb, &sEfbDepth, (rgba >> 24) / 255.0f, ((rgba >> 16) & 255) / 255.0f, ((rgba >> 8) & 255) / 255.0f,
-                     (rgba & 255) / 255.0f, (z & 0xFFFFFF) / 16777215.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
+   if (sCfgNoClear) return;
+   gx_render_step = "clear";
+   GX2ClearColor(&sEfb, (rgba >> 24) / 255.0f, ((rgba >> 16) & 255) / 255.0f, ((rgba >> 8) & 255) / 255.0f, (rgba & 255) / 255.0f);
+   GX2ClearDepthStencilEx(&sEfbDepth, (z & 0xFFFFFF) / 16777215.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
 }
 
 static void copy_tex(const GxCmd *c)
 {
    uint32_t l = c->a[0] >> 16, t = c->a[0] & 0xFFFF, w = c->a[1] >> 16, h = c->a[1] & 0xFFFF;
-   if (!w || !h) return;
+   if (l >= EFB_W / EFB_SCALE || t >= EFB_H / EFB_SCALE) w = h = 0;
+   if (l + w > EFB_W / EFB_SCALE) w = EFB_W / EFB_SCALE - l;
+   if (t + h > EFB_H / EFB_SCALE) h = EFB_H / EFB_SCALE - t;
+   if (sCfgNoCopy || !w || !h) { if (c->a[4]) clear_efb(c->a[5], c->a[6]); return; }
+   gx_render_step = "copytex";
    GX2Texture *dst = render_texture(c->a[2], w * EFB_SCALE, h * EFB_SCALE);
    if (dst) {
       GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, sEfb.surface.image, sEfb.surface.imageSize);
@@ -576,6 +586,7 @@ static uint32_t sDraws, sLastDraws, sLastVerts, sLastStates;
 static void play(GxPacket *pk)
 {
    if (!pk->numCmds) return;
+   gx_render_step = "play";
    DCFlushRange(pk->verts, pk->numVerts * sizeof(GxVertex));
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, pk->verts, pk->numVerts * sizeof(GxVertex));
    bind_efb();
@@ -587,7 +598,9 @@ static void play(GxPacket *pk)
       case GXCMD_DRAW:
          if (!c->count) break;
          if (c->state != cur) { apply_state(&pk->states[c->state]); cur = c->state; }
-         GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1);
+         if (c->first + c->count > pk->numVerts) break;
+         gx_render_step = "draw";
+         if (!sCfgNoDraw) GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1);
          draws++;
          break;
       case GXCMD_COPYTEX:
@@ -680,7 +693,7 @@ static int render_main(int argc, const char **argv)
    int big = tv->surface.width >= 1920 ? 2 : 1;
    if (!port_make_surface(&strip, tv->surface.width, 20 * big) ||
        !port_make_surface(&pad, drc->surface.width, drc->surface.height) || !init_targets() ||
-       !make_texture(&sWhite, 8, 8, GX2_TILE_MODE_LINEAR_ALIGNED)) {
+       !make_texture(&sWhite, 8, 8, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) {
       WHBLogPrintf("[gfx] out of memory for screen surfaces");
       return 0;
    }
@@ -689,6 +702,11 @@ static int render_main(int argc, const char **argv)
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, sWhite.surface.image, sWhite.surface.imageSize);
    WHBLogPrintf("[gfx] GX2 up: TV %ux%u, GamePad %ux%u, EFB %ux%u", (unsigned)tv->surface.width,
                 (unsigned)tv->surface.height, (unsigned)drc->surface.width, (unsigned)drc->surface.height, EFB_W, EFB_H);
+   sCfgNoEfb = port_cfg("noefb");
+   sCfgNoClear = port_cfg("noclear");
+   sCfgNoCopy = port_cfg("nocopy");
+   sCfgNoDraw = port_cfg("nodraw");
+   WHBLogPrintf("[gfx] switches: noefb %d noclear %d nocopy %d nodraw %d", sCfgNoEfb, sCfgNoClear, sCfgNoCopy, sCfgNoDraw);
    sGx2Up = 1;
 
    const int padRows = (int)(drc->surface.height / 16);
@@ -701,7 +719,7 @@ static int render_main(int argc, const char **argv)
          OSSleepTicks(OSMillisecondsToTicks(50));
          continue;
       }
-      if (sShaderDone && sCompiled && !sHaveShaders) sHaveShaders = finish_shaders();
+      if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) sHaveShaders = finish_shaders();
       static GxPacket idle = {.black = 1};
       GxPacket *pk = gx_acquire_packet();
       if (!pk) {
@@ -727,6 +745,7 @@ static int render_main(int argc, const char **argv)
       port_text(&strip, 4, 2 * big, big, l, 0xFFFFFFFF);
       port_upload(&strip);
 
+      gx_render_step = "present";
       WHBGfxBeginRender();
       WHBGfxBeginRenderTV();
       uint32_t cc = pk->clearColor;
@@ -739,12 +758,16 @@ static int render_main(int argc, const char **argv)
       WHBGfxClearColor(0, 0, 0, 1);
       port_blit(&pad, &drc->surface, 0, 0);
       WHBGfxFinishRenderDRC();
+      gx_render_step = "finish";
       WHBGfxFinishRender(); // swaps, waits for the GPU and the flip
+      gx_render_step = "idle";
 
       if (sHaveShaders && pk->clearAfter) {
          GX2SetContextState(sCtx);
          clear_efb(pk->clearColor, pk->clearZ);
+         gx_render_step = "clear-wait";
          GX2DrawDone();
+         gx_render_step = "idle";
       }
       if (pk != &idle) gx_release_packet(pk);
 
