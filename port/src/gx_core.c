@@ -13,6 +13,8 @@
 #include <whb/log.h>
 
 #include <math.h>
+#include <stdarg.h>
+#include <coreinit/time.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -90,7 +92,22 @@ static void flush(void);
 // Breadcrumbs for the watchdog: last GX entry point, call count, parser activity.
 volatile const char *gx_last_api = "-";
 volatile uint32_t gx_api_calls, gx_in_flush, gx_flushes;
-#define FLUSH() do { gx_last_api = __func__; gx_api_calls++; if (sMode == MODE_FIFO && port_wgp_ptr != sParse) flush(); } while (0)
+// Start-up tracing: logged, then a 30 ms busy wait so the line reaches the PC before a hang.
+static void gx_trace(const char *fmt, ...)
+{
+   char b[200];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(b, sizeof(b), fmt, ap);
+   va_end(ap);
+   WHBLogPrintf("%s", b);
+   OSTime t = OSGetSystemTime();
+   while (OSGetSystemTime() - t < OSMillisecondsToTicks(30)) {}
+}
+#define TRACE_N(n, ...) do { static int _c; if (_c < (n)) { _c++; gx_trace(__VA_ARGS__); } } while (0)
+#define FLUSH() do { gx_last_api = __func__; gx_api_calls++; \
+   TRACE_N(1, "[gxcall] %s (r13 %08X, stream %p, mode %d)", __func__, (unsigned)read_r13(), port_wgp_ptr, sMode); \
+   if (sMode == MODE_FIFO && port_wgp_ptr != sParse) flush(); } while (0)
 #define DIRTY() (sDirty = 1)
 
 static inline uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -413,6 +430,7 @@ static void push_state(void)
 
 static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
 {
+   TRACE_N(8, "[gx] prim %02X fmt %d n %u vsize %u data %p", prim, fmt, (unsigned)n, (unsigned)vertex_size(fmt), data);
    GxPacket *pk = sFill;
    uint32_t need;
    switch (prim) {
@@ -504,6 +522,7 @@ static const uint8_t *parse(const uint8_t *p, const uint8_t *end)
 
 static void flush(void)
 {
+   TRACE_N(8, "[gx] flush %d bytes at %p", (int)(port_wgp_ptr - sParse), sParse);
    gx_in_flush = 1;
    gx_flushes++;
    uint8_t *end = port_wgp_ptr;
@@ -532,6 +551,7 @@ static void flush(void)
 void wii_GXBegin(uint32_t prim, uint32_t fmt, uint16_t n)
 {
    FLUSH();
+   TRACE_N(8, "[gx] GXBegin %02X fmt %u n %u at %p (mode %d)", (unsigned)prim, (unsigned)fmt, (unsigned)n, port_wgp_ptr, sMode);
    uint8_t *p = port_wgp_ptr;
    p[0] = (uint8_t)(prim | (fmt & 7));
    p[1] = (uint8_t)(n >> 8);
@@ -542,6 +562,7 @@ void wii_GXBegin(uint32_t prim, uint32_t fmt, uint16_t n)
 void wii_GXBeginDisplayList(void *list, uint32_t size)
 {
    FLUSH();
+   TRACE_N(8, "[gx] GXBeginDisplayList %p size %u", list, (unsigned)size);
    sSaved = port_wgp_ptr;
    sDlStart = list;
    port_wgp_ptr = list;
@@ -550,6 +571,7 @@ void wii_GXBeginDisplayList(void *list, uint32_t size)
 
 uint32_t wii_GXEndDisplayList(void)
 {
+   TRACE_N(8, "[gx] GXEndDisplayList at %p (start %p)", port_wgp_ptr, sDlStart);
    uint8_t *p = port_wgp_ptr;
    while ((uint32_t)(p - sDlStart) & 31) *p++ = 0;
    uint32_t n = (uint32_t)(p - sDlStart);
@@ -561,6 +583,7 @@ uint32_t wii_GXEndDisplayList(void)
 void wii_GXCallDisplayList(const void *list, uint32_t nbytes)
 {
    FLUSH();
+   TRACE_N(8, "[gx] GXCallDisplayList %p %u bytes", list, (unsigned)nbytes);
    sStats[6]++;
    parse(list, (const uint8_t *)list + nbytes);
 }
@@ -568,6 +591,7 @@ void wii_GXCallDisplayList(const void *list, uint32_t nbytes)
 void *wii_GXRedirectWriteGatherPipe(void *ptr)
 {
    FLUSH();
+   TRACE_N(8, "[gx] GXRedirectWriteGatherPipe %p (stream was %p)", ptr, port_wgp_ptr);
    sSaved = port_wgp_ptr;
    port_wgp_ptr = ptr;
    sMode = MODE_REDIRECT;
@@ -576,6 +600,7 @@ void *wii_GXRedirectWriteGatherPipe(void *ptr)
 
 void wii_GXRestoreWriteGatherPipe(void)
 {
+   TRACE_N(8, "[gx] GXRestoreWriteGatherPipe: wrote %p, back to %p", port_wgp_ptr, sSaved);
    port_wgp_ptr = sSaved;
    sMode = MODE_FIFO;
 }
