@@ -66,9 +66,12 @@ uint32_t port_vi_retrace_count(void) { return sRetraceCount; }
 void wii_VIWaitForRetrace(void)
 {
    uint32_t count = sRetraceCount;
+   int was = OSIsInterruptEnabled();
+   if (!was) OSEnableInterrupts();
    while (count == sRetraceCount) {
       OSSleepTicks(OSMicrosecondsToTicks(500));
    }
+   if (!was) OSDisableInterrupts();
 }
 
 void *wii_VISetPreRetraceCallback(void *cb)

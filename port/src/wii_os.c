@@ -84,7 +84,6 @@ typedef struct {
 
 #define MAP_SIZE 8192 // power of two
 static MapEntry sMap[MAP_SIZE];
-static OSMutex sMapLock;
 
 static void *alloc_zero(uint32_t size, int32_t align)
 {
@@ -96,31 +95,65 @@ static void *alloc_zero(uint32_t size, int32_t align)
    return p;
 }
 
-// Returns the Cafe object for key; creates it with `size` bytes when missing.
-static void *map_get(const void *key, uint32_t kind, uint32_t size, int *created)
+static MapEntry *map_find(const void *key, uint32_t kind, int insert)
 {
    uint32_t h = ((uint32_t)key >> 2) * 2654435761u;
-   if (created) *created = 0;
-   OSLockMutex(&sMapLock);
    for (uint32_t i = 0; i < MAP_SIZE; i++) {
       MapEntry *e = &sMap[(h + i) & (MAP_SIZE - 1)];
-      if (e->key == key && e->kind == kind) {
-         OSUnlockMutex(&sMapLock);
-         return e->obj;
-      }
-      if (e->key == NULL) {
-         e->key = key;
-         e->kind = kind;
-         e->obj = alloc_zero(size, 16);
-         if (created) *created = 1;
-         OSUnlockMutex(&sMapLock);
-         return e->obj;
-      }
+      if (e->key == key && e->kind == kind) return e;
+      if (e->key == NULL) return insert ? e : NULL;
    }
-   OSUnlockMutex(&sMapLock);
-   OSFatal("Rayman port: Wii object map full");
    return NULL;
 }
+
+// Returns the Cafe object for key; creates it with `size` bytes when missing.
+// Locking is an interrupts-off section, not a mutex: callers may already run with
+// interrupts disabled or in an alarm callback, where blocking is not allowed. Every game
+// thread runs on the same core, so this excludes them all.
+static void *map_get(const void *key, uint32_t kind, uint32_t size, int *created)
+{
+   if (created) *created = 0;
+   int en = OSDisableInterrupts();
+   MapEntry *e = map_find(key, kind, 0);
+   OSRestoreInterrupts(en);
+   if (e) return e->obj;
+
+   void *obj = alloc_zero(size, 16); // outside the critical section
+   en = OSDisableInterrupts();
+   e = map_find(key, kind, 1);
+   if (!e) {
+      OSRestoreInterrupts(en);
+      OSFatal("Rayman port: Wii object map full");
+   }
+   if (e->key == NULL) {
+      e->key = key;
+      e->kind = kind;
+      e->obj = obj;
+      obj = NULL;
+      if (created) *created = 1;
+   }
+   void *result = e->obj;
+   OSRestoreInterrupts(en);
+   if (obj) MEMFreeToDefaultHeap(obj); // lost a race: someone else created it
+   return result;
+}
+
+// Wii code often blocks with interrupts disabled (the single-core Wii OS is built for it).
+// Calling Cafe scheduler functions in that state wedges the core, so blocking calls run
+// with interrupts enabled and restore the caller's state afterwards.
+static inline int irq_enable_for_block(void)
+{
+   int was = OSIsInterruptEnabled();
+   if (!was) OSEnableInterrupts();
+   return was;
+}
+
+static inline void irq_restore_after_block(int was)
+{
+   if (!was) OSDisableInterrupts();
+}
+
+#define POLL_TICKS OSMicrosecondsToTicks(200)
 
 // ---------------------------------------------------------------------------------------
 // Memory: arenas and OS heaps
@@ -145,7 +178,6 @@ void port_mem_init(void)
    sMem1Hi = sMem1Lo + MEM1_ARENA_SIZE;
    sMem2Lo = alloc_zero(MEM2_ARENA_SIZE, 64);
    sMem2Hi = sMem2Lo + MEM2_ARENA_SIZE;
-   OSInitMutex(&sMapLock);
    WHBLogPrintf("[mem] MEM1 arena %p-%p, MEM2 arena %p-%p", sMem1Lo, sMem1Hi, sMem2Lo, sMem2Hi);
 }
 
@@ -302,6 +334,10 @@ typedef struct {
    void *func;         // void *(*)(void *)
    void *param;
    void *result;
+   int started;                 // first OSResumeThread starts the Cafe thread
+   int extSuspended;            // suspended by another thread (real Cafe suspend)
+   volatile uint32_t resumes;   // resumes received while not Cafe-suspended
+   volatile uint32_t consumed;  // ... consumed by self-suspends
 } ThreadRec;
 
 static ThreadRec sThreads[MAX_THREADS];
@@ -346,6 +382,7 @@ void port_register_boot_thread(OSThread *cafe)
 {
    ThreadRec *r = thread_new(sBootWiiThread);
    r->cafe = cafe;
+   r->started = 1;
 }
 
 static int game_thread_entry(int argc, const char **argv)
@@ -377,6 +414,9 @@ int wii_OSCreateThread(void *wiiThread, void *func, void *param, void *stackTop,
    }
    r->func = func;
    r->param = param;
+   r->started = 0;
+   r->extSuspended = 0;
+   r->resumes = r->consumed = 0;
    memset((uint8_t *)wiiThread + 0x30C, 0, 12); // error, specific[0], specific[1] - as the Wii does
    // Wii is single-core: keep every game thread on the main core so interrupt-disabled
    // critical sections and priority scheduling behave like on the Wii.
@@ -395,16 +435,45 @@ int wii_OSCreateThread(void *wiiThread, void *func, void *param, void *stackTop,
    return ok;
 }
 
+// Wii suspend/resume semantics without handing interrupts-disabled scheduler calls to
+// Cafe OS. Self-suspension (the game's "check flag, then suspend myself" wait) is a
+// counter wait, so a resume that arrives before the suspend is not lost.
 int32_t wii_OSResumeThread(void *t)
 {
    ThreadRec *r = thread_by_wii(t);
-   return r ? OSResumeThread(r->cafe) : 0;
+   if (!r) return 0;
+   if (!r->started) {
+      r->started = 1;
+      int was = irq_enable_for_block();
+      int32_t prev = OSResumeThread(r->cafe);
+      irq_restore_after_block(was);
+      return prev;
+   }
+   if (r->extSuspended > 0) {
+      r->extSuspended--;
+      int was = irq_enable_for_block();
+      int32_t prev = OSResumeThread(r->cafe);
+      irq_restore_after_block(was);
+      return prev;
+   }
+   r->resumes++;
+   return 1;
 }
 
 int32_t wii_OSSuspendThread(void *t)
 {
    ThreadRec *r = thread_by_wii(t);
-   return r ? OSSuspendThread(r->cafe) : 0;
+   if (!r) return 0;
+   int was = irq_enable_for_block();
+   if (r->cafe == OSGetCurrentThread()) {
+      while (r->resumes == r->consumed) OSSleepTicks(POLL_TICKS);
+      r->consumed++;
+   } else {
+      r->extSuspended++;
+      OSSuspendThread(r->cafe);
+   }
+   irq_restore_after_block(was);
+   return 0;
 }
 
 void wii_OSCancelThread(void *t)
@@ -445,25 +514,41 @@ void *wii_OSGetThreadSpecific(int32_t idx)
    return (idx >= 0 && idx < 2) ? thread_specific()[idx] : NULL;
 }
 
-void wii_OSYieldThread(void) { OSYieldThread(); }
-void wii_OSSleepTicks(int64_t ticks) { OSSleepTicks(ticks); }
-
-static OSThreadQueue *queue_of(void *wiiQueue)
+void wii_OSYieldThread(void)
 {
-   int created;
-   OSThreadQueue *q = map_get(wiiQueue, MAP_QUEUE, sizeof(OSThreadQueue), &created);
-   if (created) OSInitThreadQueue(q);
-   return q;
+   int was = irq_enable_for_block();
+   OSYieldThread();
+   irq_restore_after_block(was);
 }
+void wii_OSSleepTicks(int64_t ticks)
+{
+   int was = irq_enable_for_block();
+   OSSleepTicks(ticks);
+   irq_restore_after_block(was);
+}
+
+// Wii thread queues: OSWakeupThread bumps a sequence number, OSSleepThread waits for it to
+// change. The sequence is read before interrupts are re-enabled, so no wakeup is missed.
+typedef struct { volatile uint32_t seq; } QueueRec;
+
+static QueueRec *queue_of(void *wiiQueue) { return map_get(wiiQueue, MAP_QUEUE, sizeof(QueueRec), NULL); }
 
 void wii_OSInitThreadQueue(void *wiiQueue)
 {
    memset(wiiQueue, 0, 8);
-   OSInitThreadQueue(queue_of(wiiQueue));
+   queue_of(wiiQueue);
 }
 
-void wii_OSSleepThread(void *wiiQueue) { OSSleepThread(queue_of(wiiQueue)); }
-void wii_OSWakeupThread(void *wiiQueue) { OSWakeupThread(queue_of(wiiQueue)); }
+void wii_OSSleepThread(void *wiiQueue)
+{
+   QueueRec *q = queue_of(wiiQueue);
+   uint32_t seq = q->seq;
+   int was = irq_enable_for_block();
+   while (q->seq == seq) OSSleepTicks(POLL_TICKS);
+   irq_restore_after_block(was);
+}
+
+void wii_OSWakeupThread(void *wiiQueue) { queue_of(wiiQueue)->seq++; }
 
 // ---------------------------------------------------------------------------------------
 // Mutexes and condition variables
@@ -485,10 +570,23 @@ static OSCondition *cond_of(void *c)
 }
 
 void wii_OSInitMutex(void *m) { OSInitMutex(mutex_of(m)); }
-void wii_OSLockMutex(void *m) { OSLockMutex(mutex_of(m)); }
+void wii_OSLockMutex(void *m)
+{
+   OSMutex *cm = mutex_of(m);
+   int was = irq_enable_for_block();
+   OSLockMutex(cm);
+   irq_restore_after_block(was);
+}
 void wii_OSUnlockMutex(void *m) { OSUnlockMutex(mutex_of(m)); }
 void wii_OSInitCond(void *c) { OSInitCond(cond_of(c)); }
-void wii_OSWaitCond(void *c, void *m) { OSWaitCond(cond_of(c), mutex_of(m)); }
+void wii_OSWaitCond(void *c, void *m)
+{
+   OSCondition *cc = cond_of(c);
+   OSMutex *cm = mutex_of(m);
+   int was = irq_enable_for_block();
+   OSWaitCond(cc, cm);
+   irq_restore_after_block(was);
+}
 void wii_OSSignalCond(void *c) { OSSignalCond(cond_of(c)); }
 
 // ---------------------------------------------------------------------------------------

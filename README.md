@@ -19,7 +19,8 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Wii U hardware probes (clock, small data r2/r13, paired singles, GQRs, memory) | ✅ — see `docs/hardware_findings.md` |
 | Game code linked into an RPX, static constructors and `main()` run on hardware | ✅ |
 | Disc access from SD card (`DVD*`), threads, mutexes, alarms, heaps | ✅ first version |
-| 60 Hz frame clock (`VIWaitForRetrace`, retrace callbacks) | 🔧 in progress |
+| 60 Hz frame clock (`VIWaitForRetrace`, retrace callbacks) | ✅ |
+| Wii blocking primitives safe on Cafe OS (no scheduler calls with interrupts off) | 🔧 testing (first-boot 7) |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
 Current boot reaches `ITF::GameInterface::init`, loads `bootsequence_WII.ipk` and `menus_WII.ipk`.
@@ -61,18 +62,15 @@ Current boot reaches `ITF::GameInterface::init`, loads `bootsequence_WII.ipk` an
 2. Copy the built `.rpx` to `sd:/wiiu/apps/` and launch it from the Wii U Menu.
 3. Optional: `python udplog.py` on a PC on the same network shows the live log (UDP port 4405).
 
-Build instructions for the game object and RPX will be completed as the remaining scripts are added
-(see "Repository layout").
+See `prep/README.md` for building the game object from your disc, and `port/tools/build.sh` for the RPX.
 
 ## Repository layout
 
 ```
-decomp/config/SOJP41/symbols.txt   symbol map (from the disc's debug ELF)
-docs/                              decomp notes, SDK boundary report, hardware findings
-port/src/                          Wii SDK replacement layer + boot code
-port/tools/                        stub generator, SDA relocation fix-up, build script
-port/rayman.ld                     linker script (wut.ld + small-data sections)
+decomp/        decomp-toolkit project: configure.py, config/SOJP41 (config, splits, symbols)
+prep/          game-object preparation scripts (classification, patching, partial link)
+port/src/      Wii SDK replacement layer + boot code
+port/tools/    stub generator, SDA relocation fix-up, build script
+port/rayman.ld linker script (wut.ld + small-data sections)
+docs/          decomp notes, SDK boundary report (+ per-symbol list), hardware findings
 ```
-
-Still to be added: the decomp `configure.py`/config/splits, the game-object preparation scripts
-(boundary analysis, assembly patcher, partial link, symbol isolation) and the disc extraction script.

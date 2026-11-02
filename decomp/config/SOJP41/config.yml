@@ -1,0 +1,17 @@
+# Rayman Origins (Europe) - SOJP41
+# Symbols and splits were generated from the unstripped wii_ITF_Techno_f.elf found on the disc
+# (byte-identical to main.dol). See docs/rayman_notes.md.
+object_base: orig/SOJP41
+object: sys/main.dol
+hash: 0a2b590b87adfd696320f9e41d6653d99c1dbf39
+symbols: config/SOJP41/symbols.txt
+splits: config/SOJP41/splits.txt
+# Wii-era linker; adjust if the link fails on .comment handling.
+mw_comment_version: 14
+detect_objects: true
+detect_strings: true
+write_asm: true
+
+
+# Custom linker script: __ArenaLo == _db_stack_addr in this game (see docs/rayman_notes.md)
+ldscript_template: config/SOJP41/ldscript.tpl
