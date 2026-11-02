@@ -301,13 +301,18 @@ static int init_targets(void)
    return s->image && d->image && sCtx && sBlitVerts;
 }
 
-static const char kPlainVS[], kPlainPS[];
+static const char kPlainVS[], kPlainPS[], kProbeVS[], kProbePS[];
+static void probe_init(void);
+static void probe_draw(void);
+static WHBGfxShaderGroup sProbe;
+static int sHaveProbe;
 static WHBGfxShaderGroup sPlain;
 static int sHavePlain;
 static int compile_shaders(void)
 {
    int ok = compile(&sTev, kTevVS, kTevPS, "TEV") && compile(&sBlit, kBlitVS, kBlitPS, "blit");
    if (ok) sHavePlain = compile(&sPlain, kPlainVS, kPlainPS, "self-test");
+   if (ok) sHaveProbe = compile(&sProbe, kProbeVS, kProbePS, "probe");
    return ok;
 }
 
@@ -746,6 +751,7 @@ static void selftest_init(void)
    st->misc[0][0] = 1; st->misc[0][1] = 7; st->misc[1][0] = 7; // 1 stage, alpha test ALWAYS
    st->colorUpdate = st->alphaUpdate = 1;
    WHBLogPrintf("[gfx] self-test ready (plain shader %d)", sHavePlain);
+   probe_init();
 }
 
 static void selftest_draw(void)
@@ -771,6 +777,78 @@ static void selftest_draw(void)
    apply_state(&sTestState);
    GX2SetViewport(0, 0, EFB_W, EFB_H, 0, 1);
    STEP("self-test green", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 6, 1));
+   probe_draw();
+}
+
+// ---------------------------------------------------------------------------------------
+// Uniform delivery probe: a shader whose colour is a uniform, drawn six times with six
+// delivery methods. Whichever squares show their colour use a method that works.
+// ---------------------------------------------------------------------------------------
+static const char kProbeVS[] =
+   "#version 330 core\n"
+   "layout(location = 0) in vec4 aPos;\n"
+   "void main() { gl_Position = vec4(aPos.xy, 0.0, 1.0); }\n";
+static const char kProbePS[] =
+   "#version 330 core\n"
+   "uniform vec4 uPad[3];\n"
+   "uniform vec4 uColor;\n"
+   "out vec4 fragColor;\n"
+   "void main() { fragColor = uColor + uPad[1] * 0.0; }\n";
+static int32_t sProbeOff = -1;
+static GxVertex *sProbeVerts;
+static uint8_t *sProbeUbo;
+
+static void probe_init(void)
+{
+   if (!sHaveProbe) return;
+   WHBGfxInitShaderAttribute(&sProbe, "aPos", 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
+   WHBGfxInitFetchShader(&sProbe);
+   GX2PixelShader *ps = sProbe.pixelShader;
+   sProbeOff = uniform_offset(ps->uniformVars, ps->uniformVarCount, "uColor");
+   WHBLogPrintf("[probe] ps mode %d, %u uniforms, %u blocks; uColor offset %d (uPad offset %d)", (int)ps->mode,
+                (unsigned)ps->uniformVarCount, (unsigned)ps->uniformBlockCount, (int)sProbeOff,
+                (int)uniform_offset(ps->uniformVars, ps->uniformVarCount, "uPad"));
+   for (uint32_t i = 0; i < ps->uniformVarCount; i++)
+      WHBLogPrintf("[probe]   var '%s' type %d count %u offset %u block %d", ps->uniformVars[i].name, (int)ps->uniformVars[i].type,
+                   (unsigned)ps->uniformVars[i].count, (unsigned)ps->uniformVars[i].offset, (int)ps->uniformVars[i].block);
+   sProbeVerts = MEMAllocFromDefaultHeapEx(36 * sizeof(GxVertex), 256);
+   sProbeUbo = MEMAllocFromDefaultHeapEx(6 * 256, 256);
+   if (!sProbeVerts || !sProbeUbo) return;
+   for (int i = 0; i < 6; i++) selftest_square(sProbeVerts + 6 * i, -0.95f + i * 0.2f, 0.70f, -0.80f + i * 0.2f, 0.50f, 1, 1, 1);
+   DCFlushRange(sProbeVerts, 36 * sizeof(GxVertex));
+}
+
+// 0 blue: block loc 0 plain | 1 yellow: block loc 0 swapped | 2 magenta: register, offset/4
+// 3 cyan: register, offset as is | 4 white: block loc 1 plain | 5 orange: block loc 1 swapped
+static void probe_draw(void)
+{
+   if (!sProbeVerts || !sProbeUbo || sProbeOff < 0) return;
+   static const float col[6][4] = {{0, 0, 1, 1}, {1, 1, 0, 1}, {1, 0, 1, 1}, {0, 1, 1, 1}, {1, 1, 1, 1}, {1, 0.5f, 0, 1}};
+   GX2SetFetchShader(&sProbe.fetchShader);
+   GX2SetVertexShader(sProbe.vertexShader);
+   GX2SetPixelShader(sProbe.pixelShader);
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sProbeVerts, 36 * sizeof(GxVertex));
+   GX2SetAttribBuffer(0, 36 * sizeof(GxVertex), sizeof(GxVertex), sProbeVerts);
+   for (int m = 0; m < 6; m++) {
+      uint32_t size = (uint32_t)sProbeOff + 16;
+      uint8_t *ubo = sProbeUbo + m * 256;
+      memset(ubo, 0, 256);
+      const uint32_t *cw = (const uint32_t *)col[m];
+      int swap = (m == 1 || m == 5);
+      if (m == 2 || m == 3) {
+         GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_REGISTER);
+         GX2SetPixelUniformReg(m == 2 ? (uint32_t)sProbeOff / 4 : (uint32_t)sProbeOff, 4, col[m]);
+      } else {
+         if ((uint32_t)sProbeOff + 16 <= 256)
+            for (int k = 0; k < 4; k++) ((uint32_t *)(ubo + sProbeOff))[k] = swap ? __builtin_bswap32(cw[k]) : cw[k];
+         DCFlushRange(ubo, 256);
+         GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_UNIFORM_BLOCK, ubo, 256);
+         GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
+         GX2SetPixelUniformBlock(m >= 4 ? 1 : 0, size, ubo);
+      }
+      STEP("probe square", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 6 * m, 1));
+   }
+   GX2SetShaderMode(sBlockMode ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER);
 }
 
 // One-time dump of the first draws: state and where the vertices land in clip space.
