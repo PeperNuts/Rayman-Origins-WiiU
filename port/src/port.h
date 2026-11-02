@@ -31,11 +31,15 @@ uint32_t port_vi_retrace_count(void);
 // wii_gx.c
 void port_gx_retrace(void);
 uint32_t port_gx_breakpoints(void);
+uint32_t port_gx_copy_clear(void);
+uint32_t port_gx_copy_disp(void);
+int port_vi_black(void);
 
 // screen.c
 void port_screen_init(void);
 void port_screen_draw(void);
 void port_screen_free(void);
+void port_render_start(void);
 
 // watch.c
 void port_watch_start(void);

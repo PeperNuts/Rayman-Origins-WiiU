@@ -101,7 +101,6 @@ static int watch_main(int argc, const char **argv)
    uint32_t lastFrames = 0, frozen = 0;
    static char buf[1400];
    for (;;) {
-      if (ProcUIInForeground()) port_screen_draw(); // never touch the screen in the background
       OSSleepTicks(OSMillisecondsToTicks(100));
       if (++ticks % 10) continue;
       seconds++;
@@ -134,7 +133,13 @@ static int watch_main(int argc, const char **argv)
          // Where each game thread waits: saved PC/LR plus game return addresses up its stack.
          OSThread *threads[24];
          int count = port_game_threads(threads, 16);
-         count += port_rad_threads(threads + count, 24 - count);
+         OSThread *rad[8];
+         int nrad = port_rad_threads(rad, 8);
+         for (int k = 0; k < nrad && count < 24; k++) { // RAD threads with a shadow are listed already
+            int dup = 0;
+            for (int j = 0; j < count; j++) dup |= threads[j] == rad[k];
+            if (!dup) threads[count++] = rad[k];
+         }
          for (int i = 0; i < count; i++) {
             log_thread_stack("[stack]", threads[i]);
             OSMutex *m = threads[i]->mutex; // the Cafe mutex this thread is blocked on

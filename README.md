@@ -27,8 +27,9 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | GX FIFO-breakpoint / draw-sync completion signals (render loop at 60 fps) | ✅ past Health & Safety to the splash screen |
 | RAD/Bink threading (rrThread/rrMutex/rrSemaphore/atomics) for intro videos | ✅ |
 | Wii Remote input drives the game: Health & Safety → main menu → prologue level | ✅ first-boot 13 |
-| Main thread stall after the intro video starts (Bink IO suspended the main thread) | 🔧 fix in first-boot 15 |
-| Split screens: TV status page, GamePad log (until the renderer exists) | ✅ first-boot 16 |
+| Main thread stall after the intro video starts (Bink IO suspended the main thread) | ✅ first-boot 15 — runs into the prologue level |
+| Split screens: TV status page, GamePad log | ✅ first-boot 16 |
+| GX2 renderer stage 1: GX2 on CPU2, TV shows the game's copy-clear colour, GamePad log | 🔧 first-boot 17 |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
 With a Wii Remote, the game goes from Health & Safety through the main menu into the prologue level and starts the intro video (no video output yet).
