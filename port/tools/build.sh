@@ -35,6 +35,9 @@ done
     --start-group "$DKP/devkitPPC/powerpc-eabi/lib/libsysbase.a" "$DKP/devkitPPC/powerpc-eabi/lib/libc.a" --end-group \
     "$GCCLIB/libgcc.a" "$GCCLIB/crtend.o" "$GCCLIB/ecrtn.o"
 
+# GX FIFO stores -> stream trampolines (gx_core.c parses the stream)
+python3 -I tools/wgp_patch.py "$BIN/powerpc-eabi-objdump" "$BIN/powerpc-eabi-nm" "$OUT/rayman.elf"
+
 # Small-data instructions were resolved by ld against anchors that move together with the
 # data, so the loader must not touch them: turn their relocations into R_PPC_NONE.
 "$BIN/powerpc-eabi-objcopy" --strip-debug -R .note.GNU-stack "$OUT/rayman.elf" "$OUT/rayman_stripped.elf"

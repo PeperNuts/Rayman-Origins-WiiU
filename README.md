@@ -29,7 +29,8 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Wii Remote input drives the game: Health & Safety → main menu → prologue level | ✅ first-boot 13 |
 | Main thread stall after the intro video starts (Bink IO suspended the main thread) | ✅ first-boot 15 — runs into the prologue level |
 | Split screens: TV status page, GamePad log | ✅ first-boot 16 |
-| GX2 renderer stage 1: GX2 on CPU2, TV shows the game's copy-clear colour, GamePad log | 🔧 first-boot 17 |
+| GX2 renderer stage 1: GX2 on CPU2, TV shows the game's copy-clear colour, GamePad log | ✅ first-boot 17 |
+| GX emulation: FIFO capture, vertex decoding, TEV ubershader (CafeGLSL), textures, EFB copies | 🔧 first-boot 18 |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
 With a Wii Remote, the game goes from Health & Safety through the main menu into the prologue level and starts the intro video (no video output yet).
@@ -51,6 +52,11 @@ With a Wii Remote, the game goes from Health & Safety through the main menu into
      asynchronous callbacks (the game's file layer depends on both)
    - `wii_vi.c` — 60 Hz retrace clock
    - `wii_gx.c` — GX completion signals (FIFO breakpoint callback, draw-sync tokens)
+   - `gx_core.c` — GX front end: the FIFO stream (see `tools/wgp_patch.py`), display lists, vertex
+     formats/arrays/matrices, colour channels, TEV/blend/texture state → frame packets
+   - `gx_render.c`, `gx_tex.c` — GX2 back end on CPU2: 2× EFB render target, a TEV ubershader compiled
+     at start-up by [CafeGLSL](https://github.com/Exzap/CafeGLSL) (`sd:/wiiu/libs/glslcompiler.rpl`),
+     Wii texture decoding and cache, EFB→texture copies, scaled output to the TV
    - `wii_rad.c` — RAD Game Tools threading used by Bink (threads, mutexes, semaphores, atomics)
    - `wii_kpad.c` — Wii Remotes through the Wii U's own KPAD/WPAD (same `KPADStatus` layout)
    - `port/tools/gen_stubs.py` — everything else: copies self-contained Wii functions verbatim, copies data

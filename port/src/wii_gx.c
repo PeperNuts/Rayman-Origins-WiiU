@@ -50,20 +50,7 @@ void port_gx_retrace(void)
 
 uint32_t port_gx_breakpoints(void) { return sBreakPtFired; }
 
-// Display copy state for the TV (render.c): stage 1 of the GX2 backend shows the game's
-// copy-clear colour each time it copies a frame to the display (GXCopyDisp).
-static volatile uint32_t sCopyClear = 0x000000FFu; // RGBA
-static volatile uint32_t sCopyDisp;
+// VISetBlack: the back end shows black while the game blanks the display.
 static volatile int sViBlack = 1;
-
-void wii_GXSetCopyClear(const uint8_t *rgba, uint32_t z)
-{
-   sCopyClear = ((uint32_t)rgba[0] << 24) | ((uint32_t)rgba[1] << 16) | ((uint32_t)rgba[2] << 8) | rgba[3];
-}
-
-void wii_GXCopyDisp(void *dest, int clear) { sCopyDisp++; }
 void wii_VISetBlack(int black) { sViBlack = black; }
-
-uint32_t port_gx_copy_clear(void) { return sCopyClear; }
-uint32_t port_gx_copy_disp(void) { return sCopyDisp; }
 int port_vi_black(void) { return sViBlack; }

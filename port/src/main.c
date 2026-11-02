@@ -19,7 +19,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 17"
+#define PORT_VERSION "first-boot 18"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -124,7 +124,7 @@ int main(int argc, char **argv)
    port_mem_init();
    port_dvd_init();
    port_vi_init(); // on the main thread = CPU1, where the game runs
-   port_render_start(); // GX2 on CPU2: TV = game display, GamePad = log
+   port_render_start(); // GX front end + GX2 back end on CPU2: TV = game, GamePad = log
 
    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_DSI, crash_dsi);
    OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ISI, crash_isi);

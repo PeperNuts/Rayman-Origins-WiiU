@@ -40,6 +40,14 @@ void port_screen_init(void);
 void port_screen_draw(void);
 void port_screen_free(void);
 void port_render_start(void);
+#define PORT_LOG_COLS 110
+int port_log_snapshot(char out[][PORT_LOG_COLS], int rows);
+struct GX2Surface;
+int port_make_surface(struct GX2Surface *s, uint32_t w, uint32_t h);
+void port_fill(struct GX2Surface *s, uint32_t rgba);
+void port_text(struct GX2Surface *s, int x, int y, int scale, const char *str, uint32_t fg);
+void port_upload(struct GX2Surface *s);
+void port_blit(struct GX2Surface *src, struct GX2Surface *dst, int x, int y);
 
 // watch.c
 void port_watch_start(void);
