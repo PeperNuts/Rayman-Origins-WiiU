@@ -46,7 +46,7 @@ volatile const char *gx_render_step = "init"; // breadcrumb for the watchdog
 // Shaders
 // ---------------------------------------------------------------------------------------
 static const char kTevVS[] =
-   "#version 330 core\n"
+   "#version 420 core\n"
    "layout(location = 0) in vec4 aPos;\n"
    "layout(location = 1) in vec4 aC0;\n"
    "layout(location = 2) in vec4 aC1;\n"
@@ -55,7 +55,9 @@ static const char kTevVS[] =
    "layout(location = 5) in vec4 aT2;\n"
    "layout(location = 6) in vec4 aT3;\n"
    "uniform vec4 uProj[4];\n"
-   "out vec4 vC0; out vec4 vC1; out vec4 vT0; out vec4 vT1; out vec4 vT2; out vec4 vT3;\n"
+   "layout(location = 0) out vec4 vC0; layout(location = 1) out vec4 vC1;\n"
+   "layout(location = 2) out vec4 vT0; layout(location = 3) out vec4 vT1;\n"
+   "layout(location = 4) out vec4 vT2; layout(location = 5) out vec4 vT3;\n"
    "void main() {\n"
    "  vec4 p = vec4(aPos.xyz, 1.0);\n"
    "  vec4 c = vec4(dot(uProj[0], p), dot(uProj[1], p), dot(uProj[2], p), dot(uProj[3], p));\n"
@@ -65,11 +67,15 @@ static const char kTevVS[] =
    "}\n";
 
 static const char kTevPS[] =
-   "#version 330 core\n"
-   "in vec4 vC0; in vec4 vC1; in vec4 vT0; in vec4 vT1; in vec4 vT2; in vec4 vT3;\n"
-   "out vec4 fragColor;\n"
-   "uniform sampler2D uTex0; uniform sampler2D uTex1; uniform sampler2D uTex2; uniform sampler2D uTex3;\n"
-   "uniform sampler2D uTex4; uniform sampler2D uTex5; uniform sampler2D uTex6; uniform sampler2D uTex7;\n"
+   "#version 420 core\n"
+   "layout(location = 0) in vec4 vC0; layout(location = 1) in vec4 vC1;\n"
+   "layout(location = 2) in vec4 vT0; layout(location = 3) in vec4 vT1;\n"
+   "layout(location = 4) in vec4 vT2; layout(location = 5) in vec4 vT3;\n"
+   "layout(location = 0) out vec4 fragColor;\n"
+   "layout(binding = 0) uniform sampler2D uTex0; layout(binding = 1) uniform sampler2D uTex1;\n"
+   "layout(binding = 2) uniform sampler2D uTex2; layout(binding = 3) uniform sampler2D uTex3;\n"
+   "layout(binding = 4) uniform sampler2D uTex4; layout(binding = 5) uniform sampler2D uTex5;\n"
+   "layout(binding = 6) uniform sampler2D uTex6; layout(binding = 7) uniform sampler2D uTex7;\n"
    "uniform vec4 uStage[56];\n"
    "uniform vec4 uRegs[4];\n"
    "uniform vec4 uKonst[4];\n"
@@ -157,16 +163,16 @@ static const char kTevPS[] =
    "}\n";
 
 static const char kBlitVS[] =
-   "#version 330 core\n"
+   "#version 420 core\n"
    "layout(location = 0) in vec4 aPos;\n"
-   "out vec2 vUV;\n"
+   "layout(location = 0) out vec2 vUV;\n"
    "void main() { gl_Position = vec4(aPos.xy, 0.0, 1.0); vUV = aPos.zw; }\n";
 
 static const char kBlitPS[] =
-   "#version 330 core\n"
-   "in vec2 vUV;\n"
-   "out vec4 fragColor;\n"
-   "uniform sampler2D uSrc;\n"
+   "#version 420 core\n"
+   "layout(location = 0) in vec2 vUV;\n"
+   "layout(location = 0) out vec4 fragColor;\n"
+   "layout(binding = 0) uniform sampler2D uSrc;\n"
    "void main() { fragColor = vec4(texture(uSrc, vUV).rgb, 1.0); }\n";
 
 // CafeGLSL (v0.2.0) runtime library
@@ -362,7 +368,7 @@ static int finish_shaders(void)
          sPsBlockLoc = 15;
          sPsBlockSize = (uint32_t)end;
       }
-      sUboSwap = port_cfg("uboswap"); // GPU reads blocks 8-in-32 swapped, like vertex data
+      sUboSwap = !port_cfg("ubonoswap"); // confirmed on hardware (first-boot 32): blocks need byte swapping
       sUbo = MEMAllocFromDefaultHeapEx(UBO_RING, 256);
       WHBLogPrintf("[gfx] uniform blocks: vs loc %d size %u, ps loc %d size %u, byte swap %d", (int)sVsBlockLoc,
                    (unsigned)sVsBlockSize, (int)sPsBlockLoc, (unsigned)sPsBlockSize, sUboSwap);
@@ -756,7 +762,9 @@ static void selftest_init(void)
 
 static void selftest_draw(void)
 {
-   if (!sTestVerts) return;
+   static int on = -1;
+   if (on < 0) on = port_cfg("selftest");
+   if (!on || !sTestVerts) return;
    bind_efb();
    GX2SetViewport(0, 0, EFB_W, EFB_H, 0, 1);
    GX2SetScissor(0, 0, EFB_W, EFB_H);
