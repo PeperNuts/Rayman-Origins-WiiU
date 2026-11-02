@@ -349,17 +349,17 @@ static int finish_shaders(void)
       WHBLogPrintf("[gfx]   ps block '%s' location %u size %u", ps->uniformBlocks[i].name, (unsigned)ps->uniformBlocks[i].offset,
                    (unsigned)ps->uniformBlocks[i].size);
    if (sBlockMode) {
-      // Uniform-block mode. CafeGLSL v0.2 reports mode 1 without declaring a block: loose
-      // uniforms live in an implicit block at location 0, at byte offsets.
+      // Uniform-block mode. CafeGLSL v0.2 has no uniform registers: loose uniforms are mapped to
+      // a virtual uniform block bound to buffer 15, at byte offsets (CafeGLSL README).
       if (vs->uniformBlockCount) { sVsBlockLoc = vs->uniformBlocks[0].offset; sVsBlockSize = vs->uniformBlocks[0].size; }
-      else { sVsBlockLoc = 0; sVsBlockSize = (uint32_t)(uProj >= 0 ? uProj : 0) + 64; }
+      else { sVsBlockLoc = 15; sVsBlockSize = (uint32_t)(uProj >= 0 ? uProj : 0) + 64; }
       if (ps->uniformBlockCount) { sPsBlockLoc = ps->uniformBlocks[0].offset; sPsBlockSize = ps->uniformBlocks[0].size; }
       else {
          int32_t end = 0, offs[5] = {uStage, uRegs, uKonst, uSwap, uMisc};
          int32_t sizes[5] = {GX_MAX_STAGES * 7 * 16, 64, 64, 64, 32};
          for (int i = 0; i < 5; i++)
             if (offs[i] >= 0 && offs[i] + sizes[i] > end) end = offs[i] + sizes[i];
-         sPsBlockLoc = 0;
+         sPsBlockLoc = 15;
          sPsBlockSize = (uint32_t)end;
       }
       sUboSwap = port_cfg("uboswap"); // GPU reads blocks 8-in-32 swapped, like vertex data
@@ -818,8 +818,8 @@ static void probe_init(void)
    DCFlushRange(sProbeVerts, 36 * sizeof(GxVertex));
 }
 
-// 0 blue: block loc 0 plain | 1 yellow: block loc 0 swapped | 2 magenta: register, offset/4
-// 3 cyan: register, offset as is | 4 white: block loc 1 plain | 5 orange: block loc 1 swapped
+// 0 blue: buffer 15 plain | 1 yellow: buffer 15 byte-swapped | 2 magenta: register, offset/4
+// 3 cyan: register, offset as is | 4 white: buffer 0 plain | 5 orange: buffer 0 swapped
 static void probe_draw(void)
 {
    if (!sProbeVerts || !sProbeUbo || sProbeOff < 0) return;
@@ -844,7 +844,7 @@ static void probe_draw(void)
          DCFlushRange(ubo, 256);
          GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_UNIFORM_BLOCK, ubo, 256);
          GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
-         GX2SetPixelUniformBlock(m >= 4 ? 1 : 0, size, ubo);
+         GX2SetPixelUniformBlock(m >= 4 ? 0 : 15, size, ubo);
       }
       STEP("probe square", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 6 * m, 1));
    }
