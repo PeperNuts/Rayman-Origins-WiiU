@@ -440,6 +440,69 @@ static void push_state(void)
    sDirty = 0;
 }
 
+// ---------------------------------------------------------------------------------------
+// Draw census: the first draw of every distinct state configuration is logged once, with
+// its first decoded vertex, so invisible objects can be traced to their state.
+// ---------------------------------------------------------------------------------------
+static int sParseFromDL;
+
+static uint32_t fnv(uint32_t h, const void *p, uint32_t n)
+{
+   const uint8_t *b = p;
+   for (uint32_t i = 0; i < n; i++) h = (h ^ b[i]) * 16777619u;
+   return h;
+}
+
+static void census(int fmt, const GxVertex *v)
+{
+   static uint32_t seen[96];
+   static int nseen;
+   if (nseen >= 96) return;
+   int ns = (int)sCur.misc[0][0];
+   if (ns > GX_MAX_STAGES) ns = GX_MAX_STAGES;
+   uint32_t h = 2166136261u;
+   h = fnv(h, sCur.stage, (uint32_t)ns * 7 * 16);
+   h = fnv(h, sCur.misc, sizeof(sCur.misc));
+   h = fnv(h, &sCur.blendType, 10);
+   h = fnv(h, G.chan, sizeof(G.chan));
+   h = fnv(h, &G.numChans, 4);
+   h = fnv(h, &G.numTexGens, 4);
+   h = fnv(h, G.vcd, 21);
+   h = fnv(h, &fmt, 4);
+   h = fnv(h, &sParseFromDL, 4);
+   for (int i = 0; i < nseen; i++) if (seen[i] == h) return;
+   seen[nseen++] = h;
+   const float *m = sCur.proj;
+   float cx = m[0] * v->pos[0] + m[1] * v->pos[1] + m[2] * v->pos[2] + m[3];
+   float cy = m[4] * v->pos[0] + m[5] * v->pos[1] + m[6] * v->pos[2] + m[7];
+   float cz = m[8] * v->pos[0] + m[9] * v->pos[1] + m[10] * v->pos[2] + m[11];
+   float cw = m[12] * v->pos[0] + m[13] * v->pos[1] + m[14] * v->pos[2] + m[15];
+   char vcd[32];
+   for (int a = 0; a < 21; a++) vcd[a] = (char)('0' + G.vcd[a]);
+   vcd[21] = 0;
+   WHBLogPrintf("[census] #%d %s fmt %d vcd %s | stages %d blend %u/%u/%u z %u/%u/%u upd %u/%u | acmp %.0f %.2f %.0f %.0f %.2f",
+                nseen, sParseFromDL ? "DL" : "fifo", fmt, vcd, ns, sCur.blendType, sCur.blendSrc, sCur.blendDst, sCur.zEnable,
+                sCur.zFunc, sCur.zUpdate, sCur.colorUpdate, sCur.alphaUpdate, sCur.misc[0][1], sCur.misc[0][2], sCur.misc[0][3],
+                sCur.misc[1][0], sCur.misc[1][1]);
+   WHBLogPrintf("[census]   chans %u c0 %u/%u/%u a0 %u/%u/%u mat0 %.2f %.2f %.2f %.2f amb0 %.2f %.2f %.2f %.2f | texgens %u tg0 %u/%u/%u tg1 %u/%u/%u",
+                (unsigned)G.numChans, G.chan[0].enable, G.chan[0].ambSrc, G.chan[0].matSrc, G.chan[1].enable, G.chan[1].ambSrc,
+                G.chan[1].matSrc, G.mat[0][0], G.mat[0][1], G.mat[0][2], G.mat[0][3], G.amb[0][0], G.amb[0][1], G.amb[0][2],
+                G.amb[0][3], (unsigned)G.numTexGens, G.texGen[0].func, G.texGen[0].src, G.texGen[0].mtx, G.texGen[1].func,
+                G.texGen[1].src, G.texGen[1].mtx);
+   for (int s = 0; s < ns && s < 3; s++) {
+      const float (*q)[4] = &sCur.stage[s * 7];
+      WHBLogPrintf("[census]   st%d c %.0f %.0f %.0f %.0f op %.0f/%.0f/%.0f/%.0f a %.0f %.0f %.0f %.0f op %.0f/%.0f/%.0f/%.0f out %.0f/%.0f k %.0f/%.0f tex %.0f coord %.0f chan %.0f swap %.0f/%.0f",
+                   s, q[0][0], q[0][1], q[0][2], q[0][3], q[2][0], q[2][1], q[2][2], q[2][3], q[1][0], q[1][1], q[1][2], q[1][3],
+                   q[3][0], q[3][1], q[3][2], q[3][3], q[4][0], q[4][1], q[4][2], q[4][3], q[5][0], q[5][1], q[5][2], q[5][3],
+                   q[6][0]);
+   }
+   const GxTexKey *t = &sCur.tex[0];
+   WHBLogPrintf("[census]   v0 clip %.2f %.2f %.2f w %.2f | c0 %.2f %.2f %.2f %.2f c1 %.2f %.2f %.2f %.2f | tc0 %.2f %.2f %.2f | tex0 %08X %ux%u f%u | regs0 %.2f %.2f %.2f %.2f",
+                cx, cy, cz, cw, v->c0[0], v->c0[1], v->c0[2], v->c0[3], v->c1[0], v->c1[1], v->c1[2], v->c1[3], v->tc[0][0],
+                v->tc[0][1], v->tc[0][2], (unsigned)t->image, t->width, t->height, t->fmt, sCur.regs[0][0], sCur.regs[0][1],
+                sCur.regs[0][2], sCur.regs[0][3]);
+}
+
 static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
 {
    TRACE_N(8, "[gx] prim %02X fmt %d n %u vsize %u data %p", prim, fmt, (unsigned)n, (unsigned)vertex_size(fmt), data);
@@ -472,6 +535,7 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
    for (uint32_t i = 0; i < n; i++) {
       GxVertex v;
       decode_vertex(fmt, &p, &v);
+      if (i == 0) census(fmt, &v);
       switch (prim) {
       case 0x80: case 0x88: // quads
          switch (i & 3) {
@@ -598,7 +662,9 @@ void wii_GXCallDisplayList(const void *list, uint32_t nbytes)
    FLUSH();
    TRACE_N(8, "[gx] GXCallDisplayList %p %u bytes", list, (unsigned)nbytes);
    sStats[6]++;
+   sParseFromDL = 1;
    parse(list, (const uint8_t *)list + nbytes);
+   sParseFromDL = 0;
 }
 
 void *wii_GXRedirectWriteGatherPipe(void *ptr)

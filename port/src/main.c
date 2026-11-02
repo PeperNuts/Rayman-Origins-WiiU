@@ -19,7 +19,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 34"
+#define PORT_VERSION "first-boot 35"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
