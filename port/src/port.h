@@ -43,8 +43,9 @@ void port_render_start(void);
 void port_shaders_prepare(void);
 int gx_describe(char *buf, int size);
 int port_cfg(const char *word);
-#define PORT_LOG_COLS 110
+#define PORT_LOG_COLS 240
 int port_log_snapshot(char out[][PORT_LOG_COLS], int rows);
+void port_log_udp_start(void);
 struct GX2Surface;
 int port_make_surface(struct GX2Surface *s, uint32_t w, uint32_t h);
 void port_fill(struct GX2Surface *s, uint32_t rgba);

@@ -722,11 +722,17 @@ static int render_main(int argc, const char **argv)
       if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) sHaveShaders = finish_shaders();
       static GxPacket idle = {.black = 1};
       GxPacket *pk = gx_acquire_packet();
+      static OSTime lastShown;
       if (!pk) {
-         if (sShaderDone) { OSSleepTicks(OSMillisecondsToTicks(2)); continue; }
-         OSSleepTicks(OSMillisecondsToTicks(30)); // before the game starts: keep the log on screen
+         // No frame from the game: keep the screens (log) alive every 100 ms anyway.
+         if (sShaderDone && OSGetSystemTime() - lastShown < OSMillisecondsToTicks(100)) {
+            OSSleepTicks(OSMillisecondsToTicks(2));
+            continue;
+         }
+         OSSleepTicks(OSMillisecondsToTicks(30));
          pk = &idle;
       }
+      lastShown = OSGetSystemTime();
       sFrame++;
 
       if (sHaveShaders) play(pk); // the EFB clear of GXCopyDisp happens after the frame is shown (below)

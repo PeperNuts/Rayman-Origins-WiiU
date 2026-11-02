@@ -19,7 +19,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 23"
+#define PORT_VERSION "first-boot 24"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -133,7 +133,7 @@ int main(int argc, char **argv)
    // running in the background, which has hung the console. Exit = hold POWER.
    OSEnableHomeButtonMenu(FALSE);
    port_screen_init(); // TV: status page, GamePad: log
-   WHBLogUdpInit();
+   port_log_udp_start(); // UDP from one sender thread only
    WHBLogPrintf("== Rayman Origins Wii U port - %s ==", PORT_VERSION);
 
    wii_OSBusClock = OSGetSystemInfo()->busClockSpeed;
@@ -169,7 +169,6 @@ int main(int argc, char **argv)
       OSSleepTicks(OSMillisecondsToTicks(100));
    }
 
-   WHBLogUdpDeinit();
    port_screen_free();
    WHBProcShutdown();
    return 0;

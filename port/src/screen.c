@@ -6,6 +6,10 @@
 #include <coreinit/spinlock.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+int socket_lib_init(void); // nsysnet (wut: nsysnet/_socket.h)
 #include <gx2/mem.h>
 #include <gx2/surface.h>
 #include <proc_ui/procui.h>
@@ -18,7 +22,7 @@
 #include "font8x16.h"
 #include "port.h"
 
-#define LINES 64
+#define LINES 256
 #define COLS PORT_LOG_COLS
 
 static char sLines[LINES][COLS];
@@ -123,3 +127,50 @@ void port_blit(GX2Surface *src, GX2Surface *dst, int x, int y)
    GX2CopySurfaceEx(src, 0, 0, dst, 0, 0, 1, &r, &pt);
 }
 
+// ---------------------------------------------------------------------------------------
+// UDP log sender (port 4405, same format as WHBLogUdp). Only this thread touches the
+// network: a game thread starved on CPU1 while inside sendto() would otherwise hold the
+// socket library's lock and block every other thread that logs.
+// ---------------------------------------------------------------------------------------
+static OSThread sUdp __attribute__((aligned(16)));
+static uint8_t sUdpStack[0x8000] __attribute__((aligned(16)));
+
+static int udp_main(int argc, const char **argv)
+{
+   socket_lib_init();
+   int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+   int on = 1;
+   setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+   struct sockaddr_in a;
+   memset(&a, 0, sizeof(a));
+   a.sin_family = AF_INET;
+   a.sin_port = 4405;                // big-endian CPU: already network order
+   a.sin_addr.s_addr = INADDR_BROADCAST;
+   uint32_t sent = 0;
+   static char line[COLS + 2];
+   for (;;) {
+      OSSleepTicks(OSMillisecondsToTicks(5));
+      for (;;) {
+         if (!OSUninterruptibleSpinLock_TryAcquireWithTimeout(&sLock, OSMillisecondsToTicks(2))) break;
+         uint32_t total = sCount;
+         if (total - sent > LINES) sent = total - LINES; // fell behind: skip the oldest
+         int have = sent < total;
+         if (have) strcpy(line, sLines[sent % LINES]);
+         OSUninterruptibleSpinLock_Release(&sLock);
+         if (!have) break;
+         sent++;
+         size_t n = strlen(line);
+         line[n++] = '\n';
+         sendto(sock, line, n, 0, (struct sockaddr *)&a, sizeof(a));
+      }
+   }
+   return 0;
+}
+
+void port_log_udp_start(void)
+{
+   OSCreateThread(&sUdp, (OSThreadEntryPointFn)udp_main, 0, NULL, sUdpStack + sizeof(sUdpStack), sizeof(sUdpStack), 1,
+                  OS_THREAD_ATTRIB_AFFINITY_CPU0);
+   OSSetThreadName(&sUdp, "Rayman log sender");
+   OSResumeThread(&sUdp);
+}
