@@ -39,7 +39,7 @@
 #define EFB_H (528 * EFB_SCALE)
 
 // Switches read from sd:/rayman/port.cfg (to bisect GPU problems without new builds)
-static int sCfgNoEfb, sCfgNoClear, sCfgNoCopy, sCfgNoDraw;
+static int sCfgNoEfb, sCfgNoClear, sCfgNoCopy, sCfgNoDraw, sCfgNoAfterFx;
 volatile const char *gx_render_step = "init"; // breadcrumb for the watchdog
 
 // ---------------------------------------------------------------------------------------
@@ -676,9 +676,32 @@ static void clear_efb(uint32_t rgba, uint32_t z)
    STEP("clear depth", GX2ClearDepthStencilEx(&sEfbDepth, (z & 0xFFFFFF) / 16777215.0f, 0, GX2_CLEAR_FLAGS_DEPTH));
 }
 
+// True if any active TEV stage samples a texture produced by GXCopyTex.
+static int state_uses_rt(const GxState *st)
+{
+   int n = (int)st->misc[0][0];
+   for (int s = 0; s < n && s < GX_MAX_STAGES; s++) {
+      int slot = (int)(st->stage[s * 7 + 5][0] + (st->stage[s * 7 + 5][0] < 0 ? -0.5f : 0.5f));
+      if (slot >= 0 && slot < GX_MAX_SLOTS && gx_is_render_texture(st->tex[slot].image)) return 1;
+   }
+   return 0;
+}
+
 static void copy_tex(const GxCmd *c)
 {
    uint32_t l = c->a[0] >> 16, t = c->a[0] & 0xFFFF, w = c->a[1] >> 16, h = c->a[1] & 0xFFFF;
+   {
+      static uint32_t seen[24][3];
+      static int n;
+      int dup = 0;
+      for (int i = 0; i < n; i++) dup |= seen[i][0] == c->a[0] && seen[i][1] == c->a[1] && seen[i][2] == c->a[2];
+      if (!dup && n < 24) {
+         seen[n][0] = c->a[0]; seen[n][1] = c->a[1]; seen[n][2] = c->a[2]; n++;
+         WHBLogPrintf("[copy] #%d src %u,%u %ux%u -> %08X dst %ux%u fmt %02X clear %u (colour %08X)", n, (unsigned)l, (unsigned)t,
+                      (unsigned)w, (unsigned)h, (unsigned)c->a[2], (unsigned)(c->a[3] >> 16), (unsigned)(c->a[3] & 0xFFFF),
+                      (unsigned)c->a[7], (unsigned)c->a[4], (unsigned)c->a[5]);
+      }
+   }
    if (l >= EFB_W / EFB_SCALE || t >= EFB_H / EFB_SCALE) w = h = 0;
    if (l + w > EFB_W / EFB_SCALE) w = EFB_W / EFB_SCALE - l;
    if (t + h > EFB_H / EFB_SCALE) h = EFB_H / EFB_SCALE - t;
@@ -911,6 +934,7 @@ static void play_game(GxPacket *pk)
       switch (c->type) {
       case GXCMD_DRAW:
          if (!c->count) break;
+         if (sCfgNoAfterFx && state_uses_rt(&pk->states[c->state])) break;
          if (c->state != cur) { STEP("apply state", apply_state(&pk->states[c->state])); cur = c->state; }
          dump_draw(pk, c);
          if (c->first + c->count > pk->numVerts) break;
@@ -1021,7 +1045,9 @@ static int render_main(int argc, const char **argv)
    sCfgNoClear = port_cfg("noclear");
    sCfgNoCopy = port_cfg("nocopy");
    sCfgNoDraw = port_cfg("nodraw");
-   WHBLogPrintf("[gfx] switches: noefb %d noclear %d nocopy %d nodraw %d", sCfgNoEfb, sCfgNoClear, sCfgNoCopy, sCfgNoDraw);
+   sCfgNoAfterFx = port_cfg("noafterfx");
+   WHBLogPrintf("[gfx] switches: noefb %d noclear %d nocopy %d nodraw %d noafterfx %d", sCfgNoEfb, sCfgNoClear, sCfgNoCopy,
+                sCfgNoDraw, sCfgNoAfterFx);
    sGx2Up = 1;
 
    const int padRows = (int)(drc->surface.height / 16);

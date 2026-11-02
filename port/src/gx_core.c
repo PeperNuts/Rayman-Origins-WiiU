@@ -445,6 +445,7 @@ static void push_state(void)
 // its first decoded vertex, so invisible objects can be traced to their state.
 // ---------------------------------------------------------------------------------------
 static int sParseFromDL;
+volatile uint32_t gx_nan_verts;
 
 static uint32_t fnv(uint32_t h, const void *p, uint32_t n)
 {
@@ -535,6 +536,10 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
    for (uint32_t i = 0; i < n; i++) {
       GxVertex v;
       decode_vertex(fmt, &p, &v);
+      if (v.pos[0] != v.pos[0] || v.pos[1] != v.pos[1] || v.pos[2] != v.pos[2]) { // NaN: collapse (invisible)
+         v.pos[0] = v.pos[1] = v.pos[2] = 0;
+         gx_nan_verts++;
+      }
       if (i == 0) census(fmt, &v);
       switch (prim) {
       case 0x80: case 0x88: // quads
@@ -1104,8 +1109,9 @@ int gx_describe(char *buf, int size)
    extern uint8_t *volatile port_wgp_ptr;
    static const char *modes[3] = {"fifo", "dl", "redirect"};
    extern volatile const char *gx_render_step;
-   return snprintf(buf, size, "gx: render %s, last %s, %u calls, %u flushes%s, mode %s, stream %d bytes, prims %u, pkts %u",
-                   (const char *)gx_render_step, (const char *)gx_last_api, (unsigned)gx_api_calls, (unsigned)gx_flushes, gx_in_flush ? " (IN FLUSH)" : "",
+   extern volatile uint32_t gx_nan_verts;
+   return snprintf(buf, size, "gx: nan verts %u, render %s, last %s, %u calls, %u flushes%s, mode %s, stream %d bytes, prims %u, pkts %u",
+                   (unsigned)gx_nan_verts, (const char *)gx_render_step, (const char *)gx_last_api, (unsigned)gx_api_calls, (unsigned)gx_flushes, gx_in_flush ? " (IN FLUSH)" : "",
                    modes[sMode < 3 ? sMode : 0], sMode == MODE_FIFO ? (int)(port_wgp_ptr - sParse) : -1,
                    (unsigned)sStats[0], (unsigned)sStats[4]);
 }

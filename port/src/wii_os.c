@@ -342,7 +342,10 @@ uint32_t wii_OSEnableInterrupts(void) { return OSEnableInterrupts(); }
 uint32_t wii_OSRestoreInterrupts(uint32_t level) { return OSRestoreInterrupts(level); }
 
 void wii_DCFlushRange(void *addr, uint32_t len) { DCFlushRange(addr, len); }
-void wii_DCInvalidateRange(void *addr, uint32_t len) { DCInvalidateRange(addr, len); }
+// On the Wii the GPU / write-gather pipe wrote memory behind the cache, so the game invalidates
+// ranges it is about to read. Here those writes go through the cache (FIFO trampolines, fread),
+// so dropping dirty lines would lose data: write them back instead.
+void wii_DCInvalidateRange(void *addr, uint32_t len) { DCFlushRange(addr, len); }
 void wii_DCStoreRange(void *addr, uint32_t len) { DCStoreRange(addr, len); }
 void wii_PPCSync(void) { __asm__ volatile("sync" ::: "memory"); }
 
