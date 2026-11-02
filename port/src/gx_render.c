@@ -172,6 +172,8 @@ static GX2PixelShader *(*glslPS)(const char *, char *, int, int);
 static int glsl_init(void)
 {
    OSDynLoad_Module m;
+   OSTime t0 = OSGetSystemTime();
+   WHBLogPrintf("[gfx] loading glslcompiler.rpl");
    if (OSDynLoad_Acquire("glslcompiler", &m) != OS_DYNLOAD_OK &&
        OSDynLoad_Acquire("~/wiiu/libs/glslcompiler.rpl", &m) != OS_DYNLOAD_OK) {
       WHBLogPrintf("[gfx] glslcompiler.rpl not found - copy it to sd:/wiiu/libs/");
@@ -185,7 +187,9 @@ static int glsl_init(void)
       WHBLogPrintf("[gfx] glslcompiler.rpl: exports missing");
       return 0;
    }
+   WHBLogPrintf("[gfx] glslcompiler.rpl loaded (%u ms), initialising", (unsigned)OSTicksToMilliseconds(OSGetSystemTime() - t0));
    init();
+   WHBLogPrintf("[gfx] compiler ready (%u ms)", (unsigned)OSTicksToMilliseconds(OSGetSystemTime() - t0));
    return 1;
 }
 
@@ -193,12 +197,15 @@ static int compile(WHBGfxShaderGroup *g, const char *vs, const char *ps, const c
 {
    static char log[1024];
    memset(g, 0, sizeof(*g));
+   OSTime t0 = OSGetSystemTime();
+   WHBLogPrintf("[gfx] compiling %s shaders", what);
    log[0] = 0;
    g->vertexShader = glslVS(vs, log, sizeof(log), 0);
    if (!g->vertexShader) { WHBLogPrintf("[gfx] %s vertex shader: %s", what, log); return 0; }
    log[0] = 0;
    g->pixelShader = glslPS(ps, log, sizeof(log), 0);
    if (!g->pixelShader) { WHBLogPrintf("[gfx] %s pixel shader: %s", what, log); return 0; }
+   WHBLogPrintf("[gfx] %s shaders compiled (%u ms)", what, (unsigned)OSTicksToMilliseconds(OSGetSystemTime() - t0));
    return 1;
 }
 
@@ -225,7 +232,7 @@ static GX2DepthBuffer sEfbDepth;
 static GX2Texture sEfbTex;
 static GX2ContextState *sCtx;
 static WHBGfxShaderGroup sTev, sBlit;
-static int sHaveShaders;
+static volatile int sHaveShaders, sShaderDone;
 static int32_t uProj, uStage, uRegs, uKonst, uSwap, uMisc, uSampler[GX_MAX_SLOTS], uBlitSrc;
 static float *sBlitVerts;
 
@@ -591,6 +598,35 @@ static void present_tv(const GxPacket *pk)
 }
 
 // ---------------------------------------------------------------------------------------
+// Shader compile thread: CafeGLSL (Mesa) recurses deeply, so it gets a large stack of its
+// own instead of the render thread's.
+// ---------------------------------------------------------------------------------------
+#define SHADER_STACK (8u << 20)
+static OSThread sShaderThread __attribute__((aligned(16)));
+
+static int shader_main(int argc, const char **argv)
+{
+   int ok = init_shaders();
+   if (!ok) WHBLogPrintf("[gfx] no shaders: the TV shows only the clear colour");
+   sHaveShaders = ok;
+   sShaderDone = 1;
+   return 0;
+}
+
+static void start_shader_thread(void)
+{
+   uint8_t *stack = MEMAllocFromDefaultHeapEx(SHADER_STACK, 16);
+   if (!stack || !OSCreateThread(&sShaderThread, (OSThreadEntryPointFn)shader_main, 0, NULL, stack + SHADER_STACK,
+                                 SHADER_STACK, 20, OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+      WHBLogPrintf("[gfx] could not start the shader thread");
+      sShaderDone = 1;
+      return;
+   }
+   OSSetThreadName(&sShaderThread, "Rayman shaders");
+   OSResumeThread(&sShaderThread);
+}
+
+// ---------------------------------------------------------------------------------------
 // Render thread
 // ---------------------------------------------------------------------------------------
 static OSThread sRender __attribute__((aligned(16)));
@@ -613,8 +649,7 @@ static int render_main(int argc, const char **argv)
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, sWhite.surface.image, sWhite.surface.imageSize);
    WHBLogPrintf("[gfx] GX2 up: TV %ux%u, GamePad %ux%u, EFB %ux%u", (unsigned)tv->surface.width,
                 (unsigned)tv->surface.height, (unsigned)drc->surface.width, (unsigned)drc->surface.height, EFB_W, EFB_H);
-   sHaveShaders = init_shaders();
-   if (!sHaveShaders) WHBLogPrintf("[gfx] no shaders: the TV shows only the clear colour");
+   start_shader_thread(); // compiles in the background; the screens keep updating meanwhile
 
    const int padRows = (int)(drc->surface.height / 16);
    static char rows[40][PORT_LOG_COLS];
@@ -641,7 +676,7 @@ static int render_main(int argc, const char **argv)
       snprintf(l, sizeof(l), " %s  %02u:%02u  frame %u  draws %u  verts %u  tex %u (%u MB)%s%s", port_version(),
                (unsigned)(secs / 60), (unsigned)(secs % 60), (unsigned)pk->frame, (unsigned)sLastDraws,
                (unsigned)sLastVerts, (unsigned)sNumTex, (unsigned)(sTexBytes >> 20), pk->black ? "  [VI black]" : "",
-               sHaveShaders ? "" : "  [no glslcompiler.rpl]");
+               sHaveShaders ? "" : sShaderDone ? "  [no shaders - see log]" : "  [compiling shaders]");
       port_fill(&strip, 0x000000FF);
       port_text(&strip, 4, 2 * big, big, l, 0xFFFFFFFF);
       port_upload(&strip);
