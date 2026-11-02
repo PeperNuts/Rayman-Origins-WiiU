@@ -19,7 +19,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 21"
+#define PORT_VERSION "first-boot 22"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -122,6 +122,7 @@ int main(int argc, char **argv)
                 (unsigned)read_r13(), (unsigned)read_r2());
 
    port_mem_init();
+   port_watch_start(); // first, so it reports even if start-up hangs
    port_dvd_init();
    port_vi_init(); // on the main thread = CPU1, where the game runs
    port_render_start(); // GX front end + GX2 back end on CPU2: TV = game, GamePad = log
@@ -142,7 +143,6 @@ int main(int argc, char **argv)
 
    // Console drawing and progress reporting run on the watchdog (CPU0), so a busy game
    // thread on CPU1 cannot freeze the screen. The main thread only serves ProcUI.
-   port_watch_start();
    while (WHBProcIsRunning()) {
       OSSleepTicks(OSMillisecondsToTicks(100));
    }

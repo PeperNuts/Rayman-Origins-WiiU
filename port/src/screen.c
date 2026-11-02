@@ -28,7 +28,7 @@ static OSTime sStart;
 
 static void on_log(const char *msg)
 {
-   OSUninterruptibleSpinLock_Acquire(&sLock);
+   if (!OSUninterruptibleSpinLock_TryAcquireWithTimeout(&sLock, OSMillisecondsToTicks(2))) return; // never block a logger
    while (*msg) {
       const char *nl = strchr(msg, '\n');
       size_t len = nl ? (size_t)(nl - msg) : strlen(msg);
@@ -46,7 +46,7 @@ static void on_log(const char *msg)
 // Copies the last `rows` lines (oldest first) under the lock.
 int port_log_snapshot(char out[][COLS], int rows)
 {
-   OSUninterruptibleSpinLock_Acquire(&sLock);
+   if (!OSUninterruptibleSpinLock_TryAcquireWithTimeout(&sLock, OSMillisecondsToTicks(2))) return 0;
    uint32_t total = sCount;
    int n = total < (uint32_t)rows ? (int)total : rows;
    for (int i = 0; i < n; i++) memcpy(out[i], sLines[(total - n + i) % LINES], COLS);

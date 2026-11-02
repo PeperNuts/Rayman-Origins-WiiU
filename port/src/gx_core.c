@@ -13,6 +13,7 @@
 #include <whb/log.h>
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "gx.h"
@@ -84,8 +85,12 @@ static uint32_t sNumRenderTex;
 
 uint32_t gx_stat(int i) { return (i >= 0 && i < 8) ? sStats[i] : 0; }
 
+
 static void flush(void);
-#define FLUSH() do { if (sMode == MODE_FIFO && port_wgp_ptr != sParse) flush(); } while (0)
+// Breadcrumbs for the watchdog: last GX entry point, call count, parser activity.
+volatile const char *gx_last_api = "-";
+volatile uint32_t gx_api_calls, gx_in_flush, gx_flushes;
+#define FLUSH() do { gx_last_api = __func__; gx_api_calls++; if (sMode == MODE_FIFO && port_wgp_ptr != sParse) flush(); } while (0)
 #define DIRTY() (sDirty = 1)
 
 static inline uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
@@ -499,9 +504,12 @@ static const uint8_t *parse(const uint8_t *p, const uint8_t *end)
 
 static void flush(void)
 {
+   gx_in_flush = 1;
+   gx_flushes++;
    uint8_t *end = port_wgp_ptr;
    if (end < sParse || end > sFifo + FIFO_SIZE) { // should not happen: resynchronise
       sParse = port_wgp_ptr = sFifo;
+      gx_in_flush = 0;
       return;
    }
    const uint8_t *stop = parse(sParse, end);
@@ -513,6 +521,7 @@ static void flush(void)
       sParse = sFifo;
       port_wgp_ptr = sFifo + rest;
    }
+   gx_in_flush = 0;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -966,4 +975,15 @@ void wii_GXCopyDisp(void *dest, int clear)
    p->clearColor = G.copyClear;
    p->clearZ = G.copyClearZ;
    submit_packet();
+}
+
+// One-line GX status for the watchdog.
+int gx_describe(char *buf, int size)
+{
+   extern uint8_t *volatile port_wgp_ptr;
+   static const char *modes[3] = {"fifo", "dl", "redirect"};
+   return snprintf(buf, size, "gx: last %s, %u calls, %u flushes%s, mode %s, stream %d bytes, prims %u, pkts %u",
+                   (const char *)gx_last_api, (unsigned)gx_api_calls, (unsigned)gx_flushes, gx_in_flush ? " (IN FLUSH)" : "",
+                   modes[sMode < 3 ? sMode : 0], sMode == MODE_FIFO ? (int)(port_wgp_ptr - sParse) : -1,
+                   (unsigned)sStats[0], (unsigned)sStats[4]);
 }

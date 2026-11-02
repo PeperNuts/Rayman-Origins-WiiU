@@ -112,15 +112,18 @@ static int watch_main(int argc, const char **argv)
       lastFiles = files;
       lastFrames = frames;
 
-      if (seconds <= 10 || seconds % 5 == 0) {
+      if (seconds <= 60 || seconds % 5 == 0) {
          describe_cpu1(buf, sizeof(buf));
          WHBLogPrintf("[watch] %us st%d calls %u funcs %u files %u frames %u gpu %u %s", (unsigned)seconds, port_stage(),
                       (unsigned)trace_calls(), (unsigned)distinct, (unsigned)files, (unsigned)frames,
                       (unsigned)port_gx_breakpoints(), buf);
+         char g[200];
+         gx_describe(g, sizeof(g));
+         WHBLogPrintf("[watch] %s", g);
       }
 
       // Steady state is fine while frames advance: print what the game is doing instead.
-      if (seconds == 15 || (seconds > 15 && seconds % 30 == 15)) {
+      if (seconds % 15 == 0) {
          WHBLogPrintf("==== status at %us: %u frames, %u files ====", (unsigned)seconds, (unsigned)frames, (unsigned)files);
          char fl[160];
          int fn = 0;
