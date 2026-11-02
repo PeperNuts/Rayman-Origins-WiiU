@@ -243,6 +243,12 @@ static GX2Texture sEfbTex;
 static GX2ContextState *sCtx;
 static WHBGfxShaderGroup sTev, sBlit;
 static volatile int sHaveShaders, sShaderDone;
+static int sBlockMode, sUboSwap;
+static int32_t sVsBlockLoc = -1, sPsBlockLoc = -1;
+static uint32_t sVsBlockSize, sPsBlockSize;
+#define UBO_RING (4u << 20)
+static uint8_t *sUbo;
+static uint32_t sUboPos;
 static int32_t uProj, uStage, uRegs, uKonst, uSwap, uMisc, uSampler[GX_MAX_SLOTS], uBlitSrc;
 static float *sBlitVerts;
 
@@ -322,16 +328,32 @@ static int finish_shaders(void)
       uSampler[i] = sampler_loc(ps, n);
    }
    uBlitSrc = sampler_loc(sBlit.pixelShader, "uSrc");
-   // CafeGLSL reports register-mode uniform offsets in bytes; GX2Set*UniformReg takes 32-bit
-   // words. (uStage is 56 vec4 = 224 words, so the next uniform at 896 means bytes.)
-   if (uRegs - uStage == GX_MAX_STAGES * 7 * 16 || uMisc >= 1024) {
+   sBlockMode = vs->mode == GX2_SHADER_MODE_UNIFORM_BLOCK || ps->mode == GX2_SHADER_MODE_UNIFORM_BLOCK ||
+                vs->uniformBlockCount || ps->uniformBlockCount;
+   WHBLogPrintf("[gfx] shader modes: vs %d (%u blocks) ps %d (%u blocks)", (int)vs->mode, (unsigned)vs->uniformBlockCount,
+                (int)ps->mode, (unsigned)ps->uniformBlockCount);
+   for (uint32_t i = 0; i < vs->uniformBlockCount; i++)
+      WHBLogPrintf("[gfx]   vs block '%s' location %u size %u", vs->uniformBlocks[i].name, (unsigned)vs->uniformBlocks[i].offset,
+                   (unsigned)vs->uniformBlocks[i].size);
+   for (uint32_t i = 0; i < ps->uniformBlockCount; i++)
+      WHBLogPrintf("[gfx]   ps block '%s' location %u size %u", ps->uniformBlocks[i].name, (unsigned)ps->uniformBlocks[i].offset,
+                   (unsigned)ps->uniformBlocks[i].size);
+   if (sBlockMode) {
+      // Uniform-block mode: offsets are byte offsets inside the (single) block of each stage.
+      if (vs->uniformBlockCount) { sVsBlockLoc = vs->uniformBlocks[0].offset; sVsBlockSize = vs->uniformBlocks[0].size; }
+      if (ps->uniformBlockCount) { sPsBlockLoc = ps->uniformBlocks[0].offset; sPsBlockSize = ps->uniformBlocks[0].size; }
+      sUboSwap = !port_cfg("ubonoswap");
+      sUbo = MEMAllocFromDefaultHeapEx(UBO_RING, 256);
+      WHBLogPrintf("[gfx] uniform blocks: vs loc %d size %u, ps loc %d size %u, byte swap %d", (int)sVsBlockLoc,
+                   (unsigned)sVsBlockSize, (int)sPsBlockLoc, (unsigned)sPsBlockSize, sUboSwap);
+   } else if (uRegs - uStage == GX_MAX_STAGES * 7 * 16 || uMisc >= 1024) {
       uProj = uProj >= 0 ? uProj / 4 : -1;
       uStage = uStage >= 0 ? uStage / 4 : -1;
       uRegs = uRegs >= 0 ? uRegs / 4 : -1;
       uKonst = uKonst >= 0 ? uKonst / 4 : -1;
       uSwap = uSwap >= 0 ? uSwap / 4 : -1;
       uMisc = uMisc >= 0 ? uMisc / 4 : -1;
-      WHBLogPrintf("[gfx] uniform offsets are in bytes - converted to words");
+      WHBLogPrintf("[gfx] register offsets are in bytes - converted to words");
    }
    WHBLogPrintf("[gfx] shaders ready: proj@%d stage@%d regs@%d konst@%d swap@%d misc@%d tex0@%d blit@%d", (int)uProj,
                 (int)uStage, (int)uRegs, (int)uKonst, (int)uSwap, (int)uMisc, (int)uSampler[0], (int)uBlitSrc);
@@ -479,7 +501,8 @@ static void bind_efb(void)
    GX2SetContextState(sCtx);
    GX2SetColorBuffer(&sEfb, GX2_RENDER_TARGET_0);
    GX2SetDepthBuffer(&sEfbDepth);
-   GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_REGISTER);
+   GX2SetShaderMode(sBlockMode ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER);
+   GX2SetRasterizerClipControl(TRUE, FALSE); // GX depth ranges differ: never clip on z
    GX2SetFetchShader(&sTev.fetchShader);
    GX2SetVertexShader(sTev.vertexShader);
    GX2SetPixelShader(sTev.pixelShader);
@@ -502,6 +525,33 @@ static void set_uniform(int vertex, int32_t off, uint32_t count, const void *dat
    else GX2SetPixelUniformReg(off, count, data);
 }
 
+// Uniform-block memory: a ring the GPU reads at draw time (reset per packet, after the
+// previous frame's GX2DrawDone). GX2 reads uniform blocks byte-swapped (little-endian words).
+static uint8_t *ubo_alloc(uint32_t size)
+{
+   if (!sUbo || !size) return NULL;
+   size = (size + 255) & ~255u;
+   if (sUboPos + size > UBO_RING) { GX2DrawDone(); sUboPos = 0; }
+   uint8_t *p = sUbo + sUboPos;
+   sUboPos += size;
+   memset(p, 0, size);
+   return p;
+}
+
+static void ubo_put(uint8_t *block, uint32_t size, int32_t off, const void *src, uint32_t words)
+{
+   if (off < 0 || (uint32_t)off + words * 4 > size) return;
+   const uint32_t *in = src;
+   uint32_t *out = (uint32_t *)(block + off);
+   for (uint32_t i = 0; i < words; i++) out[i] = sUboSwap ? __builtin_bswap32(in[i]) : in[i];
+}
+
+static void ubo_done(uint8_t *block, uint32_t size)
+{
+   DCFlushRange(block, size);
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_UNIFORM_BLOCK, block, size);
+}
+
 static void apply_state(const GxState *st)
 {
    const float *v = st->viewport;
@@ -510,12 +560,30 @@ static void apply_state(const GxState *st)
    int w = clampi(st->scissor[2] * EFB_SCALE, 0, EFB_W - x), h = clampi(st->scissor[3] * EFB_SCALE, 0, EFB_H - y);
    GX2SetScissor(x, y, w ? w : 1, h ? h : 1);
 
-   set_uniform(1, uProj, 16, st->proj);
-   set_uniform(0, uStage, GX_MAX_STAGES * 7 * 4, st->stage);
-   set_uniform(0, uRegs, 16, st->regs);
-   set_uniform(0, uKonst, 16, st->konst);
-   set_uniform(0, uSwap, 16, st->swap);
-   set_uniform(0, uMisc, 8, st->misc);
+   if (sBlockMode) {
+      uint8_t *vb = ubo_alloc(sVsBlockSize), *pb = ubo_alloc(sPsBlockSize);
+      if (vb && sVsBlockLoc >= 0) {
+         ubo_put(vb, sVsBlockSize, uProj, st->proj, 16);
+         ubo_done(vb, sVsBlockSize);
+         GX2SetVertexUniformBlock(sVsBlockLoc, sVsBlockSize, vb);
+      }
+      if (pb && sPsBlockLoc >= 0) {
+         ubo_put(pb, sPsBlockSize, uStage, st->stage, GX_MAX_STAGES * 7 * 4);
+         ubo_put(pb, sPsBlockSize, uRegs, st->regs, 16);
+         ubo_put(pb, sPsBlockSize, uKonst, st->konst, 16);
+         ubo_put(pb, sPsBlockSize, uSwap, st->swap, 16);
+         ubo_put(pb, sPsBlockSize, uMisc, st->misc, 8);
+         ubo_done(pb, sPsBlockSize);
+         GX2SetPixelUniformBlock(sPsBlockLoc, sPsBlockSize, pb);
+      }
+   } else {
+      set_uniform(1, uProj, 16, st->proj);
+      set_uniform(0, uStage, GX_MAX_STAGES * 7 * 4, st->stage);
+      set_uniform(0, uRegs, 16, st->regs);
+      set_uniform(0, uKonst, 16, st->konst);
+      set_uniform(0, uSwap, 16, st->swap);
+      set_uniform(0, uMisc, 8, st->misc);
+   }
 
    // textures used by the active stages
    int n = (int)st->misc[0][0];
@@ -603,10 +671,42 @@ static void copy_tex(const GxCmd *c)
 
 static uint32_t sDraws, sLastDraws, sLastVerts, sLastStates;
 
+// One-time dump of the first draws: state and where the vertices land in clip space.
+static void dump_draw(const GxPacket *pk, const GxCmd *c)
+{
+   static int n;
+   if (n >= 4) return;
+   n++;
+   const GxState *st = &pk->states[c->state];
+   const float *m = st->proj, *v = st->viewport;
+   WHBLogPrintf("[draw] #%d %u verts | vp %.0f %.0f %.0f %.0f z %.2f-%.2f | scissor %d %d %d %d | stages %.0f blend %u/%u/%u z %u/%u/%u cull %u",
+                n, (unsigned)c->count, v[0], v[1], v[2], v[3], v[4], v[5], (int)st->scissor[0], (int)st->scissor[1],
+                (int)st->scissor[2], (int)st->scissor[3], st->misc[0][0], st->blendType, st->blendSrc, st->blendDst, st->zEnable,
+                st->zFunc, st->zUpdate, st->cull);
+   WHBLogPrintf("[draw]   proj %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f", m[0], m[1],
+                m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+   WHBLogPrintf("[draw]   stage0 c %.0f %.0f %.0f %.0f a %.0f %.0f %.0f %.0f tex %.0f coord %.0f chan %.0f | acmp %.0f %.2f %.0f %.0f %.2f | tex0 %08X %ux%u fmt %u",
+                st->stage[0][0], st->stage[0][1], st->stage[0][2], st->stage[0][3], st->stage[1][0], st->stage[1][1],
+                st->stage[1][2], st->stage[1][3], st->stage[5][0], st->stage[5][1], st->stage[5][2], st->misc[0][1],
+                st->misc[0][2], st->misc[0][3], st->misc[1][0], st->misc[1][1], (unsigned)st->tex[0].image,
+                st->tex[0].width, st->tex[0].height, st->tex[0].fmt);
+   for (uint32_t i = 0; i < c->count && i < 3; i++) {
+      const GxVertex *x = &pk->verts[c->first + i];
+      float cx = m[0] * x->pos[0] + m[1] * x->pos[1] + m[2] * x->pos[2] + m[3];
+      float cy = m[4] * x->pos[0] + m[5] * x->pos[1] + m[6] * x->pos[2] + m[7];
+      float cz = m[8] * x->pos[0] + m[9] * x->pos[1] + m[10] * x->pos[2] + m[11];
+      float cw = m[12] * x->pos[0] + m[13] * x->pos[1] + m[14] * x->pos[2] + m[15];
+      WHBLogPrintf("[draw]   v%u pos %.1f %.1f %.1f -> clip %.2f %.2f %.2f w %.2f | c0 %.2f %.2f %.2f %.2f | t0 %.2f %.2f %.2f",
+                   (unsigned)i, x->pos[0], x->pos[1], x->pos[2], cx, cy, cz, cw, x->c0[0], x->c0[1], x->c0[2], x->c0[3],
+                   x->tc[0][0], x->tc[0][1], x->tc[0][2]);
+   }
+}
+
 static void play(GxPacket *pk)
 {
    if (!pk->numCmds) return;
    gx_render_step = "play";
+   sUboPos = 0; // the previous frame finished (GX2DrawDone in WHBGfxFinishRender)
    DCFlushRange(pk->verts, pk->numVerts * sizeof(GxVertex));
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, pk->verts, pk->numVerts * sizeof(GxVertex));
    STEP("bind EFB", bind_efb());
@@ -618,6 +718,7 @@ static void play(GxPacket *pk)
       case GXCMD_DRAW:
          if (!c->count) break;
          if (c->state != cur) { STEP("apply state", apply_state(&pk->states[c->state])); cur = c->state; }
+         dump_draw(pk, c);
          if (c->first + c->count > pk->numVerts) break;
          gx_render_step = "draw";
          if (!sCfgNoDraw) STEP("draw", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1));
@@ -649,7 +750,7 @@ static void present_tv(const GxPacket *pk)
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sBlitVerts, sizeof(q));
    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE, sEfb.surface.image, sEfb.surface.imageSize);
 
-   GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_REGISTER);
+   GX2SetShaderMode(sBlockMode ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER);
    GX2SetFetchShader(&sBlit.fetchShader);
    GX2SetVertexShader(sBlit.vertexShader);
    GX2SetPixelShader(sBlit.pixelShader);

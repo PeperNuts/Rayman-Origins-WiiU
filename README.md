@@ -30,7 +30,7 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Main thread stall after the intro video starts (Bink IO suspended the main thread) | ✅ first-boot 15 — runs into the prologue level |
 | Split screens: TV status page, GamePad log | ✅ first-boot 16 |
 | GX2 renderer stage 1: GX2 on CPU2, TV shows the game's copy-clear colour, GamePad log | ✅ first-boot 17 |
-| GX emulation: FIFO capture, vertex decoding, TEV ubershader (CafeGLSL), textures, EFB copies | 🔧 first-boot 18 |
+| GX emulation: FIFO capture, vertex decoding, TEV ubershader (CafeGLSL), textures, EFB copies | 🔧 runs without hangs since first-boot 27; first visible output pending |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
 With a Wii Remote, the game goes from Health & Safety through the main menu into the prologue level and starts the intro video (no video output yet).
