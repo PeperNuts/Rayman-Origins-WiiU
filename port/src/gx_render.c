@@ -132,7 +132,7 @@ static const char kTevPS[] =
    "    int slot = ri(to.x);\n"
    "    if (slot >= 0) {\n"
    "      vec4 tc = coord(max(ri(to.y), 0));\n"
-   "      vec2 uv = tc.xy / (abs(tc.z) < 1e-6 ? 1.0 : tc.z);\n"
+   "      vec2 uv = tc.xy / (abs(tc.z) < 1e-6 ? 1.0 : tc.z) * w.yz;\n"
    "      t = swz(tex(slot, uv), ri(w.x));\n"
    "    }\n"
    "    int ch = ri(to.z);\n"

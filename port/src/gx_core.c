@@ -65,6 +65,7 @@ static struct {
    uint32_t copyClear, copyClearZ;
 } G;
 
+static struct { uint8_t on; uint16_t ss, ts; } sManual[8]; // GXSetTexCoordScaleManually
 static GxState sCur;       // back end state being built
 static int sDirty = 1;
 
@@ -82,7 +83,8 @@ static GxPacket *sFill;
 static OSSpinLock sPkLock;
 
 static uint32_t sStats[8]; // prims, verts, dropped, unknown ops, packets, packets dropped, DL calls, copies
-static uint32_t sRenderTex[32]; // GXCopyTex destinations (drawn by the back end, never decoded)
+#define RT_SLOTS 4096
+static uint32_t sRenderTex[RT_SLOTS]; // GXCopyTex destinations (open-addressing set; never decoded)
 static uint32_t sNumRenderTex;
 
 uint32_t gx_stat(int i) { return (i >= 0 && i < 8) ? sStats[i] : 0; }
@@ -423,6 +425,16 @@ static void push_state(void)
 {
    GxPacket *pk = sFill;
    if (!sDirty && pk->numStates) return;
+   // per-stage texture coordinate scale (manual scaling), applied in the shader
+   for (int st = 0; st < GX_MAX_STAGES; st++) {
+      float *t = sCur.stage[st * 7 + 5], *w = sCur.stage[st * 7 + 6];
+      int slot = (int)(t[0] + (t[0] < 0 ? -0.5f : 0.5f)), tc = (int)(t[1] + (t[1] < 0 ? -0.5f : 0.5f));
+      w[1] = w[2] = 1.0f;
+      if (slot >= 0 && slot < GX_MAX_SLOTS && tc >= 0 && tc < 8 && sManual[tc].on && sCur.tex[slot].width && sCur.tex[slot].height) {
+         w[1] = (float)sManual[tc].ss / sCur.tex[slot].width;
+         w[2] = (float)sManual[tc].ts / sCur.tex[slot].height;
+      }
+   }
    if (pk->numStates >= pk->maxStates) return;
    pk->states[pk->numStates++] = sCur;
    sDirty = 0;
@@ -687,7 +699,13 @@ void wii_GXSetTexCoordGen2(uint32_t dst, uint32_t func, uint32_t src, uint32_t m
 }
 
 void wii_GXSetNumTexGens(uint8_t n) { FLUSH(); G.numTexGens = n; }
-void wii_GXSetTexCoordScaleManually(uint32_t coord, int enable, uint16_t ss, uint16_t ts) { FLUSH(); }
+// Manual scaling: the hardware uses s * ss texels instead of normalising by the texture size
+// (Bink's YUV planes share coordinates across differently sized textures).
+void wii_GXSetTexCoordScaleManually(uint32_t coord, int enable, uint16_t ss, uint16_t ts)
+{
+   FLUSH();
+   if (coord < 8) { sManual[coord].on = enable != 0; sManual[coord].ss = ss; sManual[coord].ts = ts; DIRTY(); }
+}
 void wii_GXSetTexCoordCylWrap(uint32_t coord, int s, int t) { FLUSH(); }
 
 static void proj_from_params(void)
@@ -942,7 +960,11 @@ uint32_t wii_GXGetTexBufferSize(uint16_t w, uint16_t h, uint32_t fmt, int mip, u
 
 int gx_is_render_texture(uint32_t addr)
 {
-   for (uint32_t i = 0; i < sNumRenderTex; i++) if (sRenderTex[i] == addr) return 1;
+   if (!addr) return 0;
+   for (uint32_t i = (addr >> 5) & (RT_SLOTS - 1), n = 0; n < RT_SLOTS; i = (i + 1) & (RT_SLOTS - 1), n++) {
+      if (sRenderTex[i] == addr) return 1;
+      if (!sRenderTex[i]) return 0;
+   }
    return 0;
 }
 
@@ -974,7 +996,12 @@ void wii_GXCopyTex(void *dest, int clear)
 {
    FLUSH();
    sStats[7]++;
-   if (!gx_is_render_texture((uint32_t)dest) && sNumRenderTex < 32) sRenderTex[sNumRenderTex++] = (uint32_t)dest;
+   if (dest && !gx_is_render_texture((uint32_t)dest) && sNumRenderTex < RT_SLOTS / 2) {
+      uint32_t i = ((uint32_t)dest >> 5) & (RT_SLOTS - 1);
+      while (sRenderTex[i]) i = (i + 1) & (RT_SLOTS - 1);
+      sRenderTex[i] = (uint32_t)dest;
+      sNumRenderTex++;
+   }
    GxCmd *c = new_cmd(GXCMD_COPYTEX);
    if (!c) return;
    c->a[0] = (uint32_t)G.texSrc[0] << 16 | G.texSrc[1];
