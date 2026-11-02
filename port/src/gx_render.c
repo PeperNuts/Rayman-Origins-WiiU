@@ -301,9 +301,14 @@ static int init_targets(void)
    return s->image && d->image && sCtx && sBlitVerts;
 }
 
+static const char kPlainVS[], kPlainPS[];
+static WHBGfxShaderGroup sPlain;
+static int sHavePlain;
 static int compile_shaders(void)
 {
-   return compile(&sTev, kTevVS, kTevPS, "TEV") && compile(&sBlit, kBlitVS, kBlitPS, "blit");
+   int ok = compile(&sTev, kTevVS, kTevPS, "TEV") && compile(&sBlit, kBlitVS, kBlitPS, "blit");
+   if (ok) sHavePlain = compile(&sPlain, kPlainVS, kPlainPS, "self-test");
+   return ok;
 }
 
 // Fetch shaders and uniform locations: GX2 work, done on the render thread.
@@ -681,6 +686,93 @@ static void copy_tex(const GxCmd *c)
 
 static uint32_t sDraws, sLastDraws, sLastVerts, sLastStates;
 
+// ---------------------------------------------------------------------------------------
+// Self-test squares drawn into the EFB's top-left corner every frame:
+//   red   = plain shader without uniforms (vertex fetch, EFB, presentation)
+//   green = TEV shader with a known state (uniform block path, TEV evaluation)
+// ---------------------------------------------------------------------------------------
+static const char kPlainVS[] =
+   "#version 330 core\n"
+   "layout(location = 0) in vec4 aPos;\n"
+   "layout(location = 1) in vec4 aC0;\n"
+   "out vec4 vC0;\n"
+   "void main() { gl_Position = vec4(aPos.xy, 0.0, 1.0); vC0 = aC0; }\n";
+static const char kPlainPS[] =
+   "#version 330 core\n"
+   "in vec4 vC0;\n"
+   "out vec4 fragColor;\n"
+   "void main() { fragColor = vC0; }\n";
+static GxVertex *sTestVerts;
+static GxState sTestState;
+
+static void selftest_square(GxVertex *v, float x0, float y0, float x1, float y1, float r, float g, float b)
+{
+   const float c[6][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
+   for (int i = 0; i < 6; i++) {
+      memset(&v[i], 0, sizeof(v[i]));
+      v[i].pos[0] = c[i][0]; v[i].pos[1] = c[i][1]; v[i].pos[2] = 0; v[i].pos[3] = 1;
+      v[i].c0[0] = r; v[i].c0[1] = g; v[i].c0[2] = b; v[i].c0[3] = 1;
+      v[i].c1[3] = 1;
+      v[i].tc[0][2] = 1;
+   }
+}
+
+static void selftest_init(void)
+{
+   if (sHavePlain) { // compiled with the other shaders (big-stack thread)
+      WHBGfxInitShaderAttribute(&sPlain, "aPos", 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
+      WHBGfxInitShaderAttribute(&sPlain, "aC0", 0, 16, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
+      WHBGfxInitFetchShader(&sPlain);
+   }
+   sTestVerts = MEMAllocFromDefaultHeapEx(12 * sizeof(GxVertex), 256);
+   if (!sTestVerts) return;
+   selftest_square(sTestVerts, -0.95f, 0.95f, -0.80f, 0.75f, 1, 0, 0);
+   selftest_square(sTestVerts + 6, -0.75f, 0.95f, -0.60f, 0.75f, 0, 1, 0);
+   DCFlushRange(sTestVerts, 12 * sizeof(GxVertex));
+   // TEV state: identity projection, one stage passing the rasterised colour through.
+   GxState *st = &sTestState;
+   memset(st, 0, sizeof(*st));
+   for (int i = 0; i < 4; i++) st->proj[i * 5] = 1;
+   st->proj[10] = 0.5f; st->proj[11] = -0.5f;              // z 0 -> GX clip z -0.5 (inside [-1,0])
+   st->viewport[2] = 640; st->viewport[3] = 528; st->viewport[5] = 1;
+   st->scissor[2] = 640; st->scissor[3] = 528;
+   float *s0 = st->stage[0];
+   s0[0] = 15; s0[1] = 15; s0[2] = 15; s0[3] = 10;          // colour: d = RASC
+   st->stage[1][0] = 7; st->stage[1][1] = 7; st->stage[1][2] = 7; st->stage[1][3] = 5; // alpha: d = RASA
+   st->stage[3][3] = 1; st->stage[2][3] = 1;                // clamp
+   st->stage[5][0] = -1; st->stage[5][1] = -1; st->stage[5][2] = 0; // no texture, COLOR0A0
+   static const float swap[4][4] = {{0, 1, 2, 3}, {0, 0, 0, 3}, {1, 1, 1, 3}, {2, 2, 2, 3}};
+   memcpy(st->swap, swap, sizeof(swap));
+   st->misc[0][0] = 1; st->misc[0][1] = 7; st->misc[1][0] = 7; // 1 stage, alpha test ALWAYS
+   st->colorUpdate = st->alphaUpdate = 1;
+   WHBLogPrintf("[gfx] self-test ready (plain shader %d)", sHavePlain);
+}
+
+static void selftest_draw(void)
+{
+   if (!sTestVerts) return;
+   bind_efb();
+   GX2SetViewport(0, 0, EFB_W, EFB_H, 0, 1);
+   GX2SetScissor(0, 0, EFB_W, EFB_H);
+   GX2SetColorControl(GX2_LOGIC_OP_COPY, 0, FALSE, TRUE);
+   GX2SetTargetChannelMasks(GX2_CHANNEL_MASK_RGBA, 0, 0, 0, 0, 0, 0, 0);
+   GX2SetDepthOnlyControl(FALSE, FALSE, GX2_COMPARE_FUNC_ALWAYS);
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sTestVerts, 12 * sizeof(GxVertex));
+   GX2SetAttribBuffer(0, 12 * sizeof(GxVertex), sizeof(GxVertex), sTestVerts);
+   if (sHavePlain) {
+      GX2SetFetchShader(&sPlain.fetchShader);
+      GX2SetVertexShader(sPlain.vertexShader);
+      GX2SetPixelShader(sPlain.pixelShader);
+      STEP("self-test red", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 0, 1));
+   }
+   GX2SetFetchShader(&sTev.fetchShader);
+   GX2SetVertexShader(sTev.vertexShader);
+   GX2SetPixelShader(sTev.pixelShader);
+   apply_state(&sTestState);
+   GX2SetViewport(0, 0, EFB_W, EFB_H, 0, 1);
+   STEP("self-test green", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 6, 1));
+}
+
 // One-time dump of the first draws: state and where the vertices land in clip space.
 static void dump_draw(const GxPacket *pk, const GxCmd *c)
 {
@@ -712,9 +804,15 @@ static void dump_draw(const GxPacket *pk, const GxCmd *c)
    }
 }
 
+static void play_game(GxPacket *pk);
 static void play(GxPacket *pk)
 {
-   if (!pk->numCmds) return;
+   if (pk->numCmds) play_game(pk);
+   selftest_draw();
+}
+
+static void play_game(GxPacket *pk)
+{
    gx_render_step = "play";
    sUboPos = 0; // the previous frame finished (GX2DrawDone in WHBGfxFinishRender)
    DCFlushRange(pk->verts, pk->numVerts * sizeof(GxVertex));
@@ -850,7 +948,7 @@ static int render_main(int argc, const char **argv)
          OSSleepTicks(OSMillisecondsToTicks(50));
          continue;
       }
-      if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) sHaveShaders = finish_shaders();
+      if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) selftest_init(); }
       static GxPacket idle = {.black = 1};
       GxPacket *pk = gx_acquire_packet();
       static OSTime lastShown;
