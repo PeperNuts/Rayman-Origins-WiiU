@@ -512,10 +512,31 @@ int wii_OSIsThreadTerminated(void *t)
    return r ? OSIsThreadTerminated(r->cafe) : 1;
 }
 
+// Threads the game did not create through OSCreateThread (RAD/Bink threads, our DVD worker)
+// still call Wii thread functions - e.g. Bink IO reads through hwFile::DVDReadAsyncWait,
+// which suspends OSGetCurrentThread() until the read callback resumes it. Each such thread
+// gets its own shadow Wii OSThread, so it never aliases (and suspends) the main thread.
+#define MAX_SHADOWS 12
+static uint8_t sShadowWii[MAX_SHADOWS][0x320] __attribute__((aligned(8)));
+static int sShadowCount;
+
 void *wii_OSGetCurrentThread(void)
 {
-   ThreadRec *r = thread_by_cafe(OSGetCurrentThread());
-   return r ? r->wii : sBootWiiThread;
+   OSThread *self = OSGetCurrentThread();
+   ThreadRec *r = thread_by_cafe(self);
+   if (r) return r->wii;
+   int en = OSDisableInterrupts();
+   r = thread_by_cafe(self);
+   if (!r && sShadowCount < MAX_SHADOWS) {
+      void *wii = sShadowWii[sShadowCount++];
+      r = thread_new(wii);
+      r->cafe = self;
+      r->started = 1;
+   }
+   OSRestoreInterrupts(en);
+   if (!r) return sBootWiiThread;
+   WHBLogPrintf("[thread] shadow Wii thread %p for '%s'", r->wii, self->name ? self->name : "?");
+   return r->wii;
 }
 
 // Thread-specific values live where the Wii keeps them: OSThread.specific[2] at 0x310 in the
