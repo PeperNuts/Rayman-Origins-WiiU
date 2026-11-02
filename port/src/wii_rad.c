@@ -132,6 +132,19 @@ typedef struct {
    char name[24];
 } RRThread;
 
+#define MAX_RAD_THREADS 8
+static RRThread *sRadThreads[MAX_RAD_THREADS];
+
+// For the watchdog: live RAD threads.
+int port_rad_threads(OSThread **out, int max)
+{
+   int n = 0;
+   for (int i = 0; i < MAX_RAD_THREADS && n < max; i++) {
+      if (sRadThreads[i] && sRadThreads[i]->running && !sRadThreads[i]->done) out[n++] = &sRadThreads[i]->thread;
+   }
+   return n;
+}
+
 static int rr_thread_entry(int argc, const char **argv)
 {
    RRThread *t = (RRThread *)argv;
@@ -165,6 +178,9 @@ int wii_rrThreadCreate(void *t, void *func, uint32_t stackSize, void *data, int3
       return 0;
    }
    OSSetThreadName(&r->thread, r->name);
+   for (int i = 0; i < MAX_RAD_THREADS; i++) {
+      if (sRadThreads[i] == r || !sRadThreads[i]) { sRadThreads[i] = r; break; }
+   }
    OSResumeThread(&r->thread);
    WHBLogPrintf("[rad] thread '%s' prio %d stack %u", r->name, (int)priority, (unsigned)stackSize);
    return 1;

@@ -7,6 +7,7 @@
 //    shows an OSFatal screen with every game thread's location and call stack.
 #include <coreinit/debug.h>
 #include <coreinit/thread.h>
+#include <coreinit/mutex.h>
 #include <coreinit/time.h>
 #include <whb/log.h>
 #include <whb/log_console.h>
@@ -69,6 +70,29 @@ static int describe_threads(char *buf, size_t size)
    return n;
 }
 
+// One line: thread name, priority, state and the game return addresses up its saved stack.
+static void log_thread_stack(const char *tag, OSThread *t)
+{
+   char tl[220];
+   const char *st = t->state == OS_THREAD_STATE_RUNNING ? "run" : t->state == OS_THREAD_STATE_READY ? "ready"
+                  : t->state == OS_THREAD_STATE_WAITING ? "wait" : "other";
+   int n = snprintf(tl, sizeof(tl), "%s p%d %s:", t->name ? t->name : "?", (int)t->priority, st);
+   if (t->state == OS_THREAD_STATE_RUNNING) {
+      WHBLogPrintf("%s %s (running, no saved stack)", tag, tl);
+      return;
+   }
+   uint32_t sp = t->context.gpr[1];
+   for (int d = 0; d < 16 && n < (int)sizeof(tl) - 12; d++) {
+      if (sp < 0x10000000 || sp >= 0x50000000 || (sp & 3)) break;
+      uint32_t next = *(uint32_t *)sp;
+      if (next < 0x10000000 || next >= 0x50000000 || (next & 3)) break;
+      uint32_t ra = *(uint32_t *)(next + 4);
+      if (game_off(ra) != 0xFFFFFFFFu) n += fmt_addr(tl + n, sizeof(tl) - n, ra);
+      sp = next;
+   }
+   WHBLogPrintf("%s %s", tag, tl);
+}
+
 static void log_line(const char *l) { WHBLogPrintf("  %s", l); }
 
 static int watch_main(int argc, const char **argv)
@@ -108,23 +132,17 @@ static int watch_main(int argc, const char **argv)
          WHBLogPrintf("[funcs] name:calls, in first-call order (~60 per second = every frame)");
          trace_report(log_line, 110);
          // Where each game thread waits: saved PC/LR plus game return addresses up its stack.
-         OSThread *threads[12];
-         int count = port_game_threads(threads, 12);
+         OSThread *threads[24];
+         int count = port_game_threads(threads, 16);
+         count += port_rad_threads(threads + count, 24 - count);
          for (int i = 0; i < count; i++) {
-            OSThread *t = threads[i];
-            if (t->state == OS_THREAD_STATE_RUNNING) continue;
-            char tl[200];
-            int n = snprintf(tl, sizeof(tl), "%s p%d:", t->name ? t->name : "?", (int)t->priority);
-            uint32_t sp = t->context.gpr[1];
-            for (int d = 0; d < 14 && n < (int)sizeof(tl) - 12; d++) {
-               if (sp < 0x10000000 || sp >= 0x50000000 || (sp & 3)) break;
-               uint32_t next = *(uint32_t *)sp;
-               if (next < 0x10000000 || next >= 0x50000000 || (next & 3)) break;
-               uint32_t ra = *(uint32_t *)(next + 4);
-               if (game_off(ra) != 0xFFFFFFFFu) n += fmt_addr(tl + n, sizeof(tl) - n, ra);
-               sp = next;
+            log_thread_stack("[stack]", threads[i]);
+            OSMutex *m = threads[i]->mutex; // the Cafe mutex this thread is blocked on
+            if (threads[i]->state == OS_THREAD_STATE_WAITING && m && m->owner) {
+               WHBLogPrintf("[lock]  %s waits for a mutex owned by %s", threads[i]->name ? threads[i]->name : "?",
+                            m->owner->name ? m->owner->name : "(unnamed)");
+               log_thread_stack("[owner]", m->owner);
             }
-            WHBLogPrintf("[stack] %s", tl);
          }
       }
 

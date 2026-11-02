@@ -46,6 +46,9 @@ int port_irq_enable_for_block(void);
 void port_irq_restore_after_block(int was);
 enum { PORT_MAP_RR_MUTEX = 16, PORT_MAP_RR_SEM, PORT_MAP_RR_THREAD };
 
+// wii_rad.c
+int port_rad_threads(OSThread **out, int max);
+
 // wii_os.c (threads)
 int port_game_threads(OSThread **out, int max);
 

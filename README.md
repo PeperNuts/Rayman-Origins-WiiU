@@ -25,10 +25,12 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Direct GPU writes (`0xCC008000`) redirected to a RAM window | ✅ runs stably in the main loop |
 | Wii Remote + Nunchuk via the Wii U's KPAD/WPAD (padscore) | ✅ connects (first-boot 10) |
 | GX FIFO-breakpoint / draw-sync completion signals (render loop at 60 fps) | ✅ past Health & Safety to the splash screen |
-| RAD/Bink threading (rrThread/rrMutex/rrSemaphore/atomics) for intro videos | 🔧 testing (first-boot 13) |
+| RAD/Bink threading (rrThread/rrMutex/rrSemaphore/atomics) for intro videos | ✅ |
+| Wii Remote input drives the game: Health & Safety → main menu → prologue level | ✅ first-boot 13 |
+| Allocator lock stall after the intro video starts | 🔧 diagnosing (first-boot 14) |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
-Current boot reaches the game's main loop and the Health & Safety screen, which waits for A (no video output yet).
+With a Wii Remote, the game goes from Health & Safety through the main menu into the prologue level and starts the intro video (no video output yet).
 
 ## How it works
 
