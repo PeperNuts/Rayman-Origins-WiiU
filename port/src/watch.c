@@ -105,6 +105,25 @@ static int watch_main(int argc, const char **argv)
          }
          WHBLogPrintf("[funcs] name:calls, in first-call order (~60 per second = every frame)");
          trace_report(log_line, 110);
+         // Where each game thread waits: saved PC/LR plus game return addresses up its stack.
+         OSThread *threads[12];
+         int count = port_game_threads(threads, 12);
+         for (int i = 0; i < count; i++) {
+            OSThread *t = threads[i];
+            if (t->state == OS_THREAD_STATE_RUNNING) continue;
+            char tl[200];
+            int n = snprintf(tl, sizeof(tl), "%s p%d:", t->name ? t->name : "?", (int)t->priority);
+            uint32_t sp = t->context.gpr[1];
+            for (int d = 0; d < 14 && n < (int)sizeof(tl) - 12; d++) {
+               if (sp < 0x10000000 || sp >= 0x50000000 || (sp & 3)) break;
+               uint32_t next = *(uint32_t *)sp;
+               if (next < 0x10000000 || next >= 0x50000000 || (next & 3)) break;
+               uint32_t ra = *(uint32_t *)(next + 4);
+               if (game_off(ra) != 0xFFFFFFFFu) n += fmt_addr(tl + n, sizeof(tl) - n, ra);
+               sp = next;
+            }
+            WHBLogPrintf("[stack] %s", tl);
+         }
       }
 
       const char *why = NULL;

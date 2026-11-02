@@ -102,6 +102,8 @@ int32_t wii_KPADReadEx(int32_t chan, uint8_t *wiiBufs, uint32_t length, int32_t 
    KPADError e = KPAD_ERROR_OK;
    int32_t n = KPADReadEx((KPADChan)chan, buf, length, &e);
    if (err) *err = (int32_t)e;
+   static uint32_t sReads, sEvents;
+   if (sReads++ == 0) WHBLogPrintf("[pad] game reads chan %d: %d samples, err %d", (int)chan, (int)n, (int)e);
    for (int32_t i = 0; i < n; i++) {
       KPADStatus *s = &buf[i];
       // Wii reports Nunchuk C/Z in the core button bits.
@@ -111,6 +113,11 @@ int32_t wii_KPADReadEx(int32_t chan, uint8_t *wiiBufs, uint32_t length, int32_t 
          s->release |= s->nunchuk.release & NUNCHUK_BUTTONS;
       }
       memcpy(wiiBufs + i * WII_KPAD_STATUS_SIZE, s, WII_KPAD_STATUS_SIZE);
+      if (s->trigger && sEvents < 40) {
+         sEvents++;
+         WHBLogPrintf("[pad] chan %d press %04X (held %04X, ext %d, stick %d,%d)", (int)chan, (unsigned)s->trigger,
+                      (unsigned)s->hold, (int)s->extensionType, (int)(s->nunchuk.stick.x * 100), (int)(s->nunchuk.stick.y * 100));
+      }
    }
    return n;
 }
