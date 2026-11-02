@@ -101,7 +101,7 @@ static int watch_main(int argc, const char **argv)
    uint32_t lastFrames = 0, frozen = 0;
    static char buf[1400];
    for (;;) {
-      if (ProcUIInForeground()) WHBLogConsoleDraw(); // never touch the screen in the background
+      if (ProcUIInForeground()) port_screen_draw(); // never touch the screen in the background
       OSSleepTicks(OSMillisecondsToTicks(100));
       if (++ticks % 10) continue;
       seconds++;

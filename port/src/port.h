@@ -32,6 +32,11 @@ uint32_t port_vi_retrace_count(void);
 void port_gx_retrace(void);
 uint32_t port_gx_breakpoints(void);
 
+// screen.c
+void port_screen_init(void);
+void port_screen_draw(void);
+void port_screen_free(void);
+
 // watch.c
 void port_watch_start(void);
 

@@ -28,6 +28,7 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | RAD/Bink threading (rrThread/rrMutex/rrSemaphore/atomics) for intro videos | ✅ |
 | Wii Remote input drives the game: Health & Safety → main menu → prologue level | ✅ first-boot 13 |
 | Main thread stall after the intro video starts (Bink IO suspended the main thread) | 🔧 fix in first-boot 15 |
+| Split screens: TV status page, GamePad log (until the renderer exists) | ✅ first-boot 16 |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
 
 With a Wii Remote, the game goes from Health & Safety through the main menu into the prologue level and starts the intro video (no video output yet).
