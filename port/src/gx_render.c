@@ -318,6 +318,17 @@ static int finish_shaders(void)
       uSampler[i] = sampler_loc(ps, n);
    }
    uBlitSrc = sampler_loc(sBlit.pixelShader, "uSrc");
+   // CafeGLSL reports register-mode uniform offsets in bytes; GX2Set*UniformReg takes 32-bit
+   // words. (uStage is 56 vec4 = 224 words, so the next uniform at 896 means bytes.)
+   if (uRegs - uStage == GX_MAX_STAGES * 7 * 16 || uMisc >= 1024) {
+      uProj = uProj >= 0 ? uProj / 4 : -1;
+      uStage = uStage >= 0 ? uStage / 4 : -1;
+      uRegs = uRegs >= 0 ? uRegs / 4 : -1;
+      uKonst = uKonst >= 0 ? uKonst / 4 : -1;
+      uSwap = uSwap >= 0 ? uSwap / 4 : -1;
+      uMisc = uMisc >= 0 ? uMisc / 4 : -1;
+      WHBLogPrintf("[gfx] uniform offsets are in bytes - converted to words");
+   }
    WHBLogPrintf("[gfx] shaders ready: proj@%d stage@%d regs@%d konst@%d swap@%d misc@%d tex0@%d blit@%d", (int)uProj,
                 (int)uStage, (int)uRegs, (int)uKonst, (int)uSwap, (int)uMisc, (int)uSampler[0], (int)uBlitSrc);
    return 1;
@@ -453,6 +464,20 @@ static void bind_efb(void)
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+// Uploads uniform registers, refusing anything outside the 256-vec4 register file (an
+// out-of-range write can hang the GPU).
+static void set_uniform(int vertex, int32_t off, uint32_t count, const void *data)
+{
+   static int warned;
+   if (off < 0) return;
+   if ((uint32_t)off + count > 1024) {
+      if (!warned++) WHBLogPrintf("[gfx] uniform at %d (+%u) outside the register file - skipped", (int)off, (unsigned)count);
+      return;
+   }
+   if (vertex) GX2SetVertexUniformReg(off, count, data);
+   else GX2SetPixelUniformReg(off, count, data);
+}
+
 static void apply_state(const GxState *st)
 {
    const float *v = st->viewport;
@@ -461,12 +486,12 @@ static void apply_state(const GxState *st)
    int w = clampi(st->scissor[2] * EFB_SCALE, 0, EFB_W - x), h = clampi(st->scissor[3] * EFB_SCALE, 0, EFB_H - y);
    GX2SetScissor(x, y, w ? w : 1, h ? h : 1);
 
-   if (uProj >= 0) GX2SetVertexUniformReg(uProj, 16, st->proj);
-   if (uStage >= 0) GX2SetPixelUniformReg(uStage, GX_MAX_STAGES * 7 * 4, st->stage);
-   if (uRegs >= 0) GX2SetPixelUniformReg(uRegs, 16, st->regs);
-   if (uKonst >= 0) GX2SetPixelUniformReg(uKonst, 16, st->konst);
-   if (uSwap >= 0) GX2SetPixelUniformReg(uSwap, 16, st->swap);
-   if (uMisc >= 0) GX2SetPixelUniformReg(uMisc, 8, st->misc);
+   set_uniform(1, uProj, 16, st->proj);
+   set_uniform(0, uStage, GX_MAX_STAGES * 7 * 4, st->stage);
+   set_uniform(0, uRegs, 16, st->regs);
+   set_uniform(0, uKonst, 16, st->konst);
+   set_uniform(0, uSwap, 16, st->swap);
+   set_uniform(0, uMisc, 8, st->misc);
 
    // textures used by the active stages
    int n = (int)st->misc[0][0];
