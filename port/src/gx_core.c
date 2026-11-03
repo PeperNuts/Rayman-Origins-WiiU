@@ -104,8 +104,6 @@ static void gx_trace(const char *fmt, ...)
    vsnprintf(b, sizeof(b), fmt, ap);
    va_end(ap);
    WHBLogPrintf("%s", b);
-   OSTime t = OSGetSystemTime();
-   while (OSGetSystemTime() - t < OSMillisecondsToTicks(30)) {}
 }
 #define TRACE_N(n, ...) do { static int _c; if (_c < (n)) { _c++; gx_trace(__VA_ARGS__); } } while (0)
 #define FLUSH() do { gx_last_api = __func__; gx_api_calls++; \
@@ -487,6 +485,20 @@ typedef struct {
    int chans;
 } Plan;
 
+// 112-byte vertex copy with 8-byte moves (lfd/stfd copy bits unchanged); the library
+// memcpy is far slower and was most of the game core's time in busy scenes.
+static inline void vcopy(GxVertex *restrict d, const GxVertex *restrict s)
+{
+   const double *a = (const double *)s;
+   double *b = (double *)d;
+   double t0 = a[0], t1 = a[1], t2 = a[2], t3 = a[3], t4 = a[4], t5 = a[5], t6 = a[6];
+   __asm__ volatile("" ::: "memory");
+   b[0] = t0; b[1] = t1; b[2] = t2; b[3] = t3; b[4] = t4; b[5] = t5; b[6] = t6;
+   t0 = a[7]; t1 = a[8]; t2 = a[9]; t3 = a[10]; t4 = a[11]; t5 = a[12]; t6 = a[13];
+   __asm__ volatile("" ::: "memory");
+   b[7] = t0; b[8] = t1; b[9] = t2; b[10] = t3; b[11] = t4; b[12] = t5; b[13] = t6;
+}
+
 static void plan_build(int fmt, Plan *pl)
 {
    memset(pl, 0, sizeof(*pl));
@@ -590,6 +602,20 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
 // ---------------------------------------------------------------------------------------
 // Primitives -> triangle lists in the packet
 // ---------------------------------------------------------------------------------------
+// Copy of `size` bytes (multiple of 8, both 8-aligned) without the slow library memcpy.
+static void copy8(void *restrict dst, const void *restrict src, uint32_t size)
+{
+   const double *a = (const double *)src;
+   double *b = (double *)dst;
+   uint32_t n = size / 8, i = 0;
+   for (; i + 4 <= n; i += 4) {
+      double t0 = a[i], t1 = a[i + 1], t2 = a[i + 2], t3 = a[i + 3];
+      __asm__ volatile("" ::: "memory");
+      b[i] = t0; b[i + 1] = t1; b[i + 2] = t2; b[i + 3] = t3;
+   }
+   for (; i < n; i++) { double t = a[i]; __asm__ volatile("" ::: "memory"); b[i] = t; }
+}
+
 static void push_state(void)
 {
    GxPacket *pk = sFill;
@@ -605,7 +631,7 @@ static void push_state(void)
       }
    }
    if (pk->numStates >= pk->maxStates) return;
-   pk->states[pk->numStates++] = sCur;
+   copy8(&pk->states[pk->numStates++], &sCur, sizeof(sCur));
    sDirty = 0;
 }
 
@@ -712,7 +738,7 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
    sStats[0]++;
    if (!need) return;
    push_state();
-   if (pk->numVerts + need > pk->maxVerts || pk->numStates == 0) { pk->dropped++; sStats[2]++; return; }
+   if (pk->numVerts + need + 8 > pk->maxVerts || pk->numStates == 0) { pk->dropped++; sStats[2]++; return; }
 
    GxCmd *last = pk->numCmds ? &pk->cmds[pk->numCmds - 1] : NULL;
    uint32_t st = pk->numStates - 1;
@@ -723,44 +749,55 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
       last->first = pk->numVerts;
    }
 
+   // Vertices are decoded straight into the packet; only shared corners are copied.
    GxVertex *out = pk->verts + pk->numVerts;
-   GxVertex v0, v1, v2;
+   GxVertex tmp[2];
+   const GxVertex *p0 = NULL, *p1 = NULL; // previous corners (strip) / centre and last (fan)
    const uint8_t *p = data;
    uint32_t emitted = 0;
+   // Output cache lines are claimed with dcbz just ahead of the writes, so stores into the
+   // packet do not first read each line from memory. Only lines at or after the lowest
+   // address still to be written are zeroed (earlier lines hold finished vertices).
+   uint8_t *zEnd = (uint8_t *)(out + need), *z = (uint8_t *)(((uintptr_t)out + 31) & ~(uintptr_t)31);
    for (uint32_t i = 0; i < n; i++) {
-      GxVertex v;
-      decode_fast(&plan, &p, &v);
-      if (v.pos[0] != v.pos[0] || v.pos[1] != v.pos[1] || v.pos[2] != v.pos[2]) { // NaN: collapse (invisible)
-         v.pos[0] = v.pos[1] = v.pos[2] = 0;
+      {
+         uint8_t *lo = (uint8_t *)out, *hi = (uint8_t *)(out + 6);
+         if (hi > zEnd) hi = zEnd;
+         if (z < lo) z = (uint8_t *)(((uintptr_t)lo + 31) & ~(uintptr_t)31);
+         for (; z + 32 <= hi; z += 32) __asm__ volatile("dcbz 0,%0" ::"r"(z) : "memory");
+      }
+      GxVertex *d;
+      switch (prim) {
+      case 0x80: case 0x88: { static const uint8_t slot[4] = {0, 1, 2, 5}; d = out + slot[i & 3]; break; }
+      case 0x90: d = out; break;
+      default: d = i < 2 ? &tmp[i] : out + 2; break;
+      }
+      decode_fast(&plan, &p, d);
+      if (d->pos[0] != d->pos[0] || d->pos[1] != d->pos[1] || d->pos[2] != d->pos[2]) { // NaN: collapse (invisible)
+         d->pos[0] = d->pos[1] = d->pos[2] = 0;
          gx_nan_verts++;
       }
-      if (i == 0 && sCensus) census(fmt, &v);
+      if (i == 0 && sCensus) census(fmt, d);
       switch (prim) {
-      case 0x80: case 0x88: // quads
-         switch (i & 3) {
-         case 0: v0 = v; break;
-         case 1: v1 = v; break;
-         case 2: v2 = v; break;
-         case 3: out[0] = v0; out[1] = v1; out[2] = v2; out[3] = v0; out[4] = v2; out[5] = v; out += 6; emitted += 6; break;
-         }
+      case 0x80: case 0x88: // quads: 0 1 2 | 0 2 3
+         if ((i & 3) == 3) { vcopy(out + 3, out); vcopy(out + 4, out + 2); out += 6; emitted += 6; }
          break;
       case 0x90:
-         *out++ = v; emitted++;
+         out++; emitted++;
          break;
       case 0x98: // strip
          if (i >= 2) {
-            if (i & 1) { out[0] = v1; out[1] = v0; } else { out[0] = v0; out[1] = v1; }
-            out[2] = v; out += 3; emitted += 3;
-         }
-         v0 = v1; v1 = v;
+            if (i & 1) { vcopy(out, p1); vcopy(out + 1, p0); } else { vcopy(out, p0); vcopy(out + 1, p1); }
+            p0 = p1; p1 = out + 2; out += 3; emitted += 3;
+         } else if (i == 0) p0 = d; else p1 = d;
          break;
       case 0xA0: // fan
-         if (i == 0) v0 = v;
-         else if (i >= 2) { out[0] = v0; out[1] = v1; out[2] = v; out += 3; emitted += 3; }
-         v1 = v;
+         if (i >= 2) { vcopy(out, p0); vcopy(out + 1, p1); p1 = out + 2; out += 3; emitted += 3; }
+         else if (i == 0) p0 = d; else p1 = d;
          break;
       }
    }
+   if (prim == 0x80 || prim == 0x88) { /* an incomplete last quad leaves nothing behind */ }
    if (prim == 0x90) emitted -= emitted % 3;
    pk->numVerts += emitted;
    last->count += emitted;
