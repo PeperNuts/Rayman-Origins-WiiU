@@ -111,8 +111,15 @@ static void gx_trace(const char *fmt, ...)
    if (sMode == MODE_FIFO && port_wgp_ptr != sParse) flush(); } while (0)
 #define DIRTY() (sDirty = 1)
 
-static inline uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
-static inline uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+// GX data is big-endian like the CPU: plain (possibly unaligned) integer loads.
+static inline uint16_t be16(const uint8_t *p) { uint16_t v; __builtin_memcpy(&v, p, 2); return v; }
+static inline uint32_t be32(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
+// Byte -> float tables (int-to-float conversion is slow on this CPU)
+static float kU8[256], kS8[256], kN255[256];
+static void tables_init(void)
+{
+   for (int i = 0; i < 256; i++) { kU8[i] = (float)i; kS8[i] = (float)(int8_t)i; kN255[i] = i / 255.0f; }
+}
 static inline float bef(const uint8_t *p)
 {
    uint32_t u = be32(p);
@@ -224,6 +231,7 @@ static void tev_op(int s, int mode)
 
 static void defaults(void)
 {
+   tables_init();
    memset(&G, 0, sizeof(G));
    memset(&sCur, 0, sizeof(sCur));
    for (int i = 0; i < 10; i++) {
@@ -309,8 +317,8 @@ static uint32_t vertex_size(int fmt)
 static float comp(const uint8_t *p, int type, float scale)
 {
    switch (type) {
-   case CT_U8: return p[0] * scale;
-   case CT_S8: return (int8_t)p[0] * scale;
+   case CT_U8: return kU8[p[0]] * scale;
+   case CT_S8: return kS8[p[0]] * scale;
    case CT_U16: return be16(p) * scale;
    case CT_S16: return (int16_t)be16(p) * scale;
    default: return bef(p);
@@ -334,11 +342,11 @@ static void read_color(const uint8_t *s, int type, float out[4])
    uint32_t v;
    switch (type) {
    case CLR_RGB565: v = be16(s); out[0] = ((v >> 11) & 31) / 31.0f; out[1] = ((v >> 5) & 63) / 63.0f; out[2] = (v & 31) / 31.0f; out[3] = 1; break;
-   case CLR_RGB8: case CLR_RGBX8: out[0] = s[0] / 255.0f; out[1] = s[1] / 255.0f; out[2] = s[2] / 255.0f; out[3] = 1; break;
+   case CLR_RGB8: case CLR_RGBX8: out[0] = kN255[s[0]]; out[1] = kN255[s[1]]; out[2] = kN255[s[2]]; out[3] = 1; break;
    case CLR_RGBA4: v = be16(s); out[0] = (v >> 12) / 15.0f; out[1] = ((v >> 8) & 15) / 15.0f; out[2] = ((v >> 4) & 15) / 15.0f; out[3] = (v & 15) / 15.0f; break;
    case CLR_RGBA6: v = (uint32_t)s[0] << 16 | s[1] << 8 | s[2];
       out[0] = (v >> 18) / 63.0f; out[1] = ((v >> 12) & 63) / 63.0f; out[2] = ((v >> 6) & 63) / 63.0f; out[3] = (v & 63) / 63.0f; break;
-   default: out[0] = s[0] / 255.0f; out[1] = s[1] / 255.0f; out[2] = s[2] / 255.0f; out[3] = s[3] / 255.0f; break;
+   default: out[0] = kN255[s[0]]; out[1] = kN255[s[1]]; out[2] = kN255[s[2]]; out[3] = kN255[s[3]]; break;
    }
 }
 
@@ -608,6 +616,8 @@ static void copy8(void *restrict dst, const void *restrict src, uint32_t size)
    const double *a = (const double *)src;
    double *b = (double *)dst;
    uint32_t n = size / 8, i = 0;
+   if (!((uintptr_t)dst & 31))
+      for (uint32_t z = 0; z + 32 <= size; z += 32) __asm__ volatile("dcbz %0,%1" ::"b"(dst), "r"(z) : "memory");
    for (; i + 4 <= n; i += 4) {
       double t0 = a[i], t1 = a[i + 1], t2 = a[i + 2], t3 = a[i + 3];
       __asm__ volatile("" ::: "memory");

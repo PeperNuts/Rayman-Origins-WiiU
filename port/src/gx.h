@@ -43,7 +43,7 @@ typedef struct {
    uint8_t blendType, blendSrc, blendDst, logicOp;
    uint8_t colorUpdate, alphaUpdate, zEnable, zFunc, zUpdate, cull;
    uint8_t pad[2];
-} __attribute__((aligned(8))) GxState;
+} __attribute__((aligned(32))) GxState;
 
 enum { GXCMD_DRAW, GXCMD_CLEAR, GXCMD_COPYTEX };
 
