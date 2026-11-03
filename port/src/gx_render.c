@@ -18,6 +18,8 @@
 #include <gx2/context.h>
 #include <gx2/draw.h>
 #include <gx2/event.h>
+#include <gx2/display.h>
+#include <gx2/swap.h>
 #include <gx2/enum.h>
 #include <gx2/mem.h>
 #include <gx2/registers.h>
@@ -258,7 +260,7 @@ static int32_t sVsBlockLoc = -1, sPsBlockLoc = -1;
 static uint32_t sVsBlockSize, sPsBlockSize;
 #define UBO_RING (4u << 20)
 static uint8_t *sUbo;
-static uint32_t sUboPos;
+static uint32_t sUboPos, sUboBase, sUboEnd; // the current frame's half of the ring
 static int32_t uProj, uStage, uRegs, uKonst, uSwap, uMisc, uSampler[GX_MAX_SLOTS], uBlitSrc;
 static float *sBlitVerts;
 
@@ -863,7 +865,8 @@ static uint8_t *ubo_alloc(uint32_t size)
 {
    if (!sUbo || !size) return NULL;
    size = (size + 255) & ~255u;
-   if (sUboPos + size > UBO_RING) { GX2DrawDone(); sUboPos = 0; }
+   if (!sUboEnd) sUboEnd = UBO_RING;
+   if (sUboPos + size > sUboEnd) { GX2DrawDone(); sUboPos = sUboBase; }
    uint8_t *p = sUbo + sUboPos;
    sUboPos += size;
    memset(p, 0, size);
@@ -1268,7 +1271,11 @@ static void play(GxPacket *pk)
 static void play_game(GxPacket *pk)
 {
    gx_render_step = "play";
-   sUboPos = 0; // the previous frame finished (GX2DrawDone in WHBGfxFinishRender)
+   // One frame may still be on the GPU: each frame uses its own half of the uniform ring
+   // (the frame before the previous one has finished, see the end of the render loop).
+   sUboBase = (sFrame & 1) ? UBO_RING / 2 : 0;
+   sUboEnd = sUboBase + UBO_RING / 2;
+   sUboPos = sUboBase;
    DCFlushRange(pk->verts, pk->numVerts * sizeof(GxVertex));
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, pk->verts, pk->numVerts * sizeof(GxVertex));
    STEP("bind EFB", bind_efb());
@@ -1467,8 +1474,30 @@ static int render_main(int argc, const char **argv)
       WHBGfxFinishRenderDRC();
       gx_render_step = "finish";
       OSTime tf0 = OSGetSystemTime();
-      if (sHaveShaders) STEP("finish frame", WHBGfxFinishRender()); // swaps, waits for the GPU and the flip
-      else WHBGfxFinishRender();
+      // Like WHBGfxFinishRender, but without its GX2DrawDone: the GPU works on this frame
+      // while the CPU prepares the next one. Wait only for the previous frame here.
+      static OSTime prevTs;
+      static GxPacket *prevPk;
+      static int tvOn;
+      GX2SwapScanBuffers();
+      GX2Flush();
+      if (!tvOn) { GX2SetTVEnable(TRUE); GX2SetDRCEnable(TRUE); tvOn = 1; }
+      OSTime ts = GX2GetLastSubmittedTimeStamp();
+      static int noPipe = -1;
+      if (noPipe < 0) noPipe = port_cfg("nopipeline");
+      if (noPipe) GX2DrawDone();
+      else if (prevTs) GX2WaitTimeStamp(prevTs);
+      prevTs = ts;
+      if (prevPk) gx_release_packet(prevPk);
+      prevPk = pk != &idle ? pk : NULL;
+      // at most two flips queued (keeps pacing at the TV rate without serialising CPU and GPU)
+      for (int guard = 0; guard < 4; guard++) {
+         uint32_t swaps, flips;
+         OSTime lf, lv;
+         GX2GetSwapStatus(&swaps, &flips, &lf, &lv);
+         if (swaps - flips <= 1) break;
+         GX2WaitForFlip();
+      }
       sTimeFinish += OSGetSystemTime() - tf0;
       sShown++;
       gx_render_step = "idle";
@@ -1476,11 +1505,7 @@ static int render_main(int argc, const char **argv)
       if (sHaveShaders && pk->clearAfter) {
          GX2SetContextState(sCtx);
          clear_efb(pk->clearColor, pk->clearZ);
-         gx_render_step = "clear-wait";
-         GX2DrawDone();
-         gx_render_step = "idle";
       }
-      if (pk != &idle) gx_release_packet(pk);
 
       if (secs >= lastReport + 5) {
          uint32_t span = secs - lastReport;

@@ -76,7 +76,7 @@ static uint8_t *sFifo, *sParse, *sSaved, *sDlStart;
 #define FIFO_SIZE (8u << 20)
 
 // packets
-#define NPACKETS 3
+#define NPACKETS 4 // filling, ready, and two with the render thread (one still on the GPU)
 enum { PK_FREE, PK_FILLING, PK_READY, PK_RENDERING };
 static GxPacket sPk[NPACKETS];
 static int sPkState[NPACKETS];
@@ -163,6 +163,7 @@ static void submit_packet(void)
    }
    sPkState[cur] = PK_READY;
    for (int i = 0; i < NPACKETS; i++) if (sPkState[i] == PK_FREE) { next = i; break; }
+   if (next < 0) { next = cur; sStats[5]++; } // nothing free: drop this frame, refill the same packet
    sPkState[next] = PK_FILLING;
    OSUninterruptibleSpinLock_Release(&sPkLock);
    sStats[4]++;
