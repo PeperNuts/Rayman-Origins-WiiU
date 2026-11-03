@@ -37,7 +37,7 @@ static uint32_t chain_ra(uint32_t *sp)
 // Sampling profiler for CPU1: a ~2 kHz alarm on the game core records where it interrupted
 // (64-byte PC buckets plus the interrupted thread). The watchdog prints the top entries.
 // ---------------------------------------------------------------------------------------
-#define PROF_SLOTS 4096
+#define PROF_SLOTS 8192
 typedef struct { uint32_t key, hits, lr; } ProfSlot;
 static ProfSlot sProf[PROF_SLOTS];
 static uint32_t sProfTotal, sProfLost;
@@ -126,15 +126,32 @@ uint32_t port_vi_retrace_count(void) { return sRetraceCount; }
 
 // Waits for the next retrace by polling the frame counter with short sleeps. Unlike the
 // Wii's version it never disables interrupts around the wait.
+// Frame pacing statistics for the profiler: time the game spends working vs waiting.
+volatile uint64_t port_vi_wait_ticks, port_vi_frames, port_vi_late;
+
 void wii_VIWaitForRetrace(void)
 {
+   static uint32_t lastReturn;
+   static int strict = -1;
+   if (strict < 0) strict = port_cfg("strictvsync");
    uint32_t count = sRetraceCount;
+   port_vi_frames++;
+   // Adaptive: a frame that already missed its retrace continues at once instead of
+   // waiting for the following one (which would halve the frame rate to 30).
+   if (!strict && count != lastReturn) {
+      port_vi_late++;
+      lastReturn = count;
+      return;
+   }
+   OSTime t0 = OSGetSystemTime();
    int was = OSIsInterruptEnabled();
    if (!was) OSEnableInterrupts();
    while (count == sRetraceCount) {
       OSSleepTicks(OSMicrosecondsToTicks(500));
    }
    if (!was) OSDisableInterrupts();
+   lastReturn = sRetraceCount;
+   port_vi_wait_ticks += OSGetSystemTime() - t0;
 }
 
 void *wii_VISetPreRetraceCallback(void *cb)

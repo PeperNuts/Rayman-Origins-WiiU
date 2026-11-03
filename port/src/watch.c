@@ -101,19 +101,19 @@ uint32_t port_prof_take(uint32_t *keys, uint32_t *hits, uint32_t *lrs, int max, 
 // Where CPU1 spent the last 10 seconds.
 static void prof_report(void)
 {
-   static uint32_t keys[24], hits[24], lrs[24], thrHits[24];
+   static uint32_t keys[64], hits[64], lrs[64], thrHits[24];
    static OSThread *thr[24];
    int n, nt;
-   uint32_t total = port_prof_take(keys, hits, lrs, 24, &n, thr, thrHits, &nt);
+   uint32_t total = port_prof_take(keys, hits, lrs, 64, &n, thr, thrHits, &nt);
    if (!total) return;
-   WHBLogPrintf("[prof] CPU1 %u samples in 10 s, by thread:", (unsigned)total);
-   char l[200];
-   int ln = 0;
-   for (int i = 0; i < nt; i++) {
-      const char *name = thr[i] && thr[i]->name ? thr[i]->name : "?";
-      ln += snprintf(l + ln, sizeof(l) - ln, " %s %.1f%%", name, thrHits[i] * 100.0f / total);
-      if (ln > 150 || i + 1 == nt) { WHBLogPrintf("[prof] %s", l); ln = 0; }
-   }
+   extern volatile uint64_t port_vi_wait_ticks, port_vi_frames, port_vi_late;
+   static uint64_t lw, lf, ll;
+   uint64_t w = port_vi_wait_ticks, f = port_vi_frames, la = port_vi_late;
+   if (f > lf)
+      WHBLogPrintf("[prof] game frames %u in 10 s (%u late), waiting for retrace %.1f ms per frame", (unsigned)(f - lf),
+                   (unsigned)(la - ll), OSTicksToMicroseconds(w - lw) / 1000.0f / (float)(f - lf));
+   lw = w; lf = f; ll = la;
+   WHBLogPrintf("[prof] CPU1 %u samples in 10 s", (unsigned)total);
    for (int i = 0; i < n; i++) {
       char a[24], b[24];
       fmt_addr(a, sizeof(a), keys[i] << 6);
