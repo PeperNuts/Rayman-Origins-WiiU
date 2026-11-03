@@ -410,8 +410,11 @@ typedef struct {
    int ncoords;              // texgens to produce (<= GX_MAX_COORDS)
    int copySrc[GX_MAX_COORDS]; // fast path: texcoord = TEXn (n) or -1 = zero
    int chans;
-   int cmode[2];             // 0 zero, 1 raw vertex RGBA8, 2 constant, 3 general (float)
+   int cmode[2];             // 0 zero, 1 raw vertex RGBA8, 2 constant, 3 general (bytes)
    uint8_t cconst[2][4];
+   // general: out = mat * (enable ? amb : 1), each from the vertex colour or a register
+   uint8_t mVtx[2][4], mReg[2][4], en[2][4], aVtx[2][4], aReg[2][4];
+   int rgba8[2];             // vertex colour attribute is RGBA8 (raw bytes)
 } Plan;
 
 static inline uint8_t f2u8(float v)
@@ -464,6 +467,13 @@ static void plan_build(int fmt, Plan *pl)
          pl->cmode[c] = 2;
          for (int k = 0; k < 4; k++) pl->cconst[c][k] = f2u8(G.mat[c][k]);
       } else pl->cmode[c] = 3;
+      pl->rgba8[c] = rgba8;
+      for (int k = 0; k < 4; k++) {
+         const ChanCtrl *ctl = k < 3 ? cc : ac;
+         pl->mVtx[c][k] = ctl->matSrc; pl->mReg[c][k] = f2u8(G.mat[c][k]);
+         pl->en[c][k] = ctl->enable;
+         pl->aVtx[c][k] = ctl->ambSrc; pl->aReg[c][k] = f2u8(G.amb[c][k]);
+      }
    }
    for (int i = 0; i < pl->ncoords; i++) {
       const TexGen *tg = &G.texGen[i];
@@ -501,7 +511,7 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
          }
          break;
       case VA_CLR0: case VA_CLR1:
-         if (pl->cmode[s->attr - VA_CLR0] == 1) raw[s->attr - VA_CLR0] = src;
+         if (pl->rgba8[s->attr - VA_CLR0]) raw[s->attr - VA_CLR0] = src;
          else read_color(src, s->type, clr[s->attr - VA_CLR0]);
          break;
       case VA_NRM:
@@ -530,12 +540,13 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
          break;
       case 2: out[0] = pl->cconst[c][0]; out[1] = pl->cconst[c][1]; out[2] = pl->cconst[c][2]; out[3] = pl->cconst[c][3]; break;
       default: {
-         const ChanCtrl *cc = &G.chan[c * 2], *ac = &G.chan[c * 2 + 1];
+         uint8_t vb[4];
+         if (raw[c]) { vb[0] = raw[c][0]; vb[1] = raw[c][1]; vb[2] = raw[c][2]; vb[3] = raw[c][3]; }
+         else for (int k = 0; k < 4; k++) vb[k] = f2u8(clr[c][k]); // other formats (rare) or absent (white)
          for (int k = 0; k < 4; k++) {
-            const ChanCtrl *ctl = k < 3 ? cc : ac;
-            float v = ctl->matSrc ? clr[c][k] : G.mat[c][k];
-            if (ctl->enable) v *= ctl->ambSrc ? clr[c][k] : G.amb[c][k];
-            out[k] = f2u8(v);
+            uint32_t m = pl->mVtx[c][k] ? vb[k] : pl->mReg[c][k];
+            if (pl->en[c][k]) m = (m * (pl->aVtx[c][k] ? vb[k] : pl->aReg[c][k]) * 257u + 32768u) >> 16;
+            out[k] = (uint8_t)m;
          }
       }
       }

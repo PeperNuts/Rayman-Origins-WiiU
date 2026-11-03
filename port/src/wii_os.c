@@ -341,12 +341,21 @@ uint32_t wii_OSDisableInterrupts(void) { return OSDisableInterrupts(); }
 uint32_t wii_OSEnableInterrupts(void) { return OSEnableInterrupts(); }
 uint32_t wii_OSRestoreInterrupts(uint32_t level) { return OSRestoreInterrupts(level); }
 
-void wii_DCFlushRange(void *addr, uint32_t len) { DCFlushRange(addr, len); }
-// On the Wii the GPU / write-gather pipe wrote memory behind the cache, so the game invalidates
-// ranges it is about to read. Here those writes go through the cache (FIFO trampolines, fread),
-// so dropping dirty lines would lose data: write them back instead.
-void wii_DCInvalidateRange(void *addr, uint32_t len) { DCFlushRange(addr, len); }
-void wii_DCStoreRange(void *addr, uint32_t len) { DCStoreRange(addr, len); }
+// Cache maintenance. On the Wii the game flushes vertex buffers, textures and display lists
+// so the GPU sees them. Here every consumer is a CPU core (the GX decoder on this core, the
+// texture decoder on the render core; the Espresso's caches are coherent), so flushing only
+// evicts data the decoder is about to read. Invalidating must never drop dirty lines either
+// (all writes go through the cache). So these do nothing; "dcflush" in port.cfg restores them.
+static int dc_on(void)
+{
+   static int on = -1;
+   if (on < 0) on = port_cfg("dcflush");
+   return on;
+}
+void wii_DCFlushRange(void *addr, uint32_t len) { if (dc_on()) DCFlushRange(addr, len); }
+void wii_DCFlushRangeNoSync(void *addr, uint32_t len) { if (dc_on()) DCFlushRangeNoSync(addr, len); }
+void wii_DCInvalidateRange(void *addr, uint32_t len) { if (dc_on()) DCFlushRange(addr, len); }
+void wii_DCStoreRange(void *addr, uint32_t len) { if (dc_on()) DCStoreRange(addr, len); }
 void wii_PPCSync(void) { __asm__ volatile("sync" ::: "memory"); }
 
 // ---------------------------------------------------------------------------------------
