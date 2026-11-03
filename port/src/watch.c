@@ -113,6 +113,13 @@ static void prof_report(void)
       WHBLogPrintf("[prof] game frames %u in 10 s (%u late), waiting for retrace %.1f ms per frame", (unsigned)(f - lf),
                    (unsigned)(la - ll), OSTicksToMicroseconds(w - lw) / 1000.0f / (float)(f - lf));
    lw = w; lf = f; ll = la;
+   extern volatile uint64_t gx_worker_ticks;
+   extern uint32_t gx_queue_waits(void);
+   static uint64_t lwk;
+   uint64_t wk = gx_worker_ticks;
+   WHBLogPrintf("[prof] GX worker (CPU0) busy %.1f%%, game waited for queue space %u times", OSTicksToMicroseconds(wk - lwk) / 100000.0f,
+                (unsigned)gx_queue_waits());
+   lwk = wk;
    WHBLogPrintf("[prof] CPU1 %u samples in 10 s", (unsigned)total);
    for (int i = 0; i < n; i++) {
       char a[24], b[24];

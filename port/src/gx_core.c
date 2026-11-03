@@ -10,6 +10,7 @@
 #include <coreinit/debug.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/spinlock.h>
+#include <coreinit/thread.h>
 #include <whb/log.h>
 
 #include <math.h>
@@ -72,7 +73,7 @@ static int sDirty = 1;
 
 enum { MODE_FIFO, MODE_DL, MODE_REDIRECT };
 static int sMode;
-static uint8_t *sFifo, *sParse, *sSaved, *sDlStart;
+static uint8_t *sFifo, *sSaved, *sDlStart;
 #define FIFO_SIZE (8u << 20)
 
 // packets
@@ -91,7 +92,9 @@ static uint32_t sNumRenderTex;
 uint32_t gx_stat(int i) { return (i >= 0 && i < 8) ? sStats[i] : 0; }
 
 
-static void flush(void);
+static void q_raw(void);
+static void gx_sync(void);
+static void q_init(void);
 // Breadcrumbs for the watchdog: last GX entry point, call count, parser activity.
 volatile const char *gx_last_api = "-";
 volatile uint32_t gx_api_calls, gx_in_flush, gx_flushes;
@@ -106,9 +109,10 @@ static void gx_trace(const char *fmt, ...)
    WHBLogPrintf("%s", b);
 }
 #define TRACE_N(n, ...) do { static int _c; if (_c < (n)) { _c++; gx_trace(__VA_ARGS__); } } while (0)
-#define FLUSH() do { gx_last_api = __func__; gx_api_calls++; \
-   TRACE_N(1, "[gxcall] %s (r13 %08X, stream %p, mode %d)", __func__, (unsigned)read_r13(), port_wgp_ptr, sMode); \
-   if (sMode == MODE_FIFO && port_wgp_ptr != sParse) flush(); } while (0)
+// Game side: hand the stream written so far to the GX worker (before any call that is queued).
+#define FLUSH() do { gx_api_calls++; if (sMode == MODE_FIFO && port_wgp_ptr != sFifo) q_raw(); } while (0)
+// Worker side: breadcrumb for the watchdog.
+#define WK() (gx_last_api = __func__)
 #define DIRTY() (sDirty = 1)
 
 // GX data is big-endian like the CPU: plain (possibly unaligned) integer loads.
@@ -279,8 +283,8 @@ void gx_core_init(void)
    sFill = &sPk[0];
    sPkState[0] = PK_FILLING;
    packet_begin(sFill);
-   sParse = sFifo;
    port_wgp_ptr = sFifo;
+   q_init();
    sMode = MODE_FIFO;
    WHBLogPrintf("[gx] FIFO capture at %p (trampolines %p), packets %u KiB each", sFifo, port_wgp_tramp,
                 (unsigned)((sPk[0].maxVerts * sizeof(GxVertex)) >> 10));
@@ -801,29 +805,177 @@ static const uint8_t *parse(const uint8_t *p, const uint8_t *end)
    return end;
 }
 
-static void flush(void)
+// ---------------------------------------------------------------------------------------
+// GX worker: the game thread only records. The stream it writes and every GX call that
+// changes state are put, in order, into a ring; a worker thread on CPU0 replays them
+// (decodes primitives, builds packets), like the Wii's GPU consuming its FIFO in parallel.
+// Completion signals (draw sync tokens, breakpoints) are queued too, so the game sees a
+// frame as done only once the worker has decoded it. "gxinline" in port.cfg replays on
+// the game thread instead (the old behaviour).
+// ---------------------------------------------------------------------------------------
+#define QSIZE (16u << 20)
+enum { QR_RAW = 1, QR_CALL = 2, QR_WRAP = 3 };
+typedef struct { uint32_t type, size, len; void (*fn)(const void *); } QRec; // 16 bytes, then payload
+static uint8_t *sQ;
+static volatile uint32_t sQHead, sQTail; // byte offsets: producer, consumer
+static int sInline;
+static uint8_t *sWFifo;                 // worker: stream bytes not decoded yet (a split primitive)
+static uint32_t sWLen;
+static OSThread sWorker __attribute__((aligned(16)));
+static uint32_t sQWaits;
+
+static inline void q_barrier(void) { __asm__ volatile("sync" ::: "memory"); }
+
+static void q_process(void);
+
+// Producer: room for `need` bytes (header included, multiple of 16) at the head.
+static uint8_t *q_reserve(uint32_t need)
 {
-   TRACE_N(8, "[gx] flush %d bytes at %p", (int)(port_wgp_ptr - sParse), sParse);
-   gx_in_flush = 1;
-   gx_flushes++;
-   uint8_t *end = port_wgp_ptr;
-   if (end < sParse || end > sFifo + FIFO_SIZE) { // should not happen: resynchronise
-      sParse = port_wgp_ptr = sFifo;
-      gx_in_flush = 0;
-      return;
+   for (;;) {
+      uint32_t h = sQHead, t = sQTail;
+      if (h >= t) {
+         if (QSIZE - h >= need + sizeof(QRec)) return sQ + h;
+         if (t > need) { // wrap to the start
+            QRec *w = (QRec *)(sQ + h);
+            w->type = QR_WRAP; w->size = 0;
+            q_barrier();
+            sQHead = 0;
+            continue;
+         }
+      } else if (t - h > need) return sQ + h;
+      if (sInline) { q_process(); continue; }
+      sQWaits++;
+      OSSleepTicks(OSMicrosecondsToTicks(50));
    }
+}
+
+static void q_commit(uint32_t need)
+{
+   q_barrier();
+   sQHead = sQHead + need;
+   if (sInline) q_process();
+}
+
+static void q_raw(void)
+{
+   uint32_t len = (uint32_t)(port_wgp_ptr - sFifo);
+   uint32_t need = (sizeof(QRec) + len + 15) & ~15u;
+   QRec *r = (QRec *)q_reserve(need);
+   r->type = QR_RAW; r->size = need; r->len = len; r->fn = NULL;
+   memcpy(r + 1, sFifo, len);
+   port_wgp_ptr = sFifo;
+   q_commit(need);
+}
+
+static uint32_t sCallNeed;
+static void *q_call(void (*fn)(const void *), uint32_t argSize)
+{
+   uint32_t need = (sizeof(QRec) + argSize + 15) & ~15u;
+   QRec *r = (QRec *)q_reserve(need);
+   r->type = QR_CALL; r->size = need; r->len = argSize; r->fn = fn;
+   sCallNeed = need;
+   return r + 1;
+}
+#define Q_DONE() q_commit(sCallNeed)
+
+// Waits until the worker has replayed everything queued so far.
+static void gx_sync(void)
+{
+   FLUSH();
+   while (sQTail != sQHead) {
+      if (sInline) q_process();
+      else OSSleepTicks(OSMicrosecondsToTicks(50));
+   }
+}
+
+// Worker: decodes queued stream bytes (a primitive split across two chunks waits for the rest).
+static void w_raw(const uint8_t *data, uint32_t len)
+{
    static int noDecode = -1;
    if (noDecode < 0) noDecode = port_cfg("nodecode");
-   const uint8_t *stop = noDecode ? end : parse(sParse, end);
-   if (stop == end) {
-      sParse = port_wgp_ptr = sFifo;
-   } else {
-      uint32_t rest = (uint32_t)(end - stop);
-      memmove(sFifo, stop, rest);
-      sParse = sFifo;
-      port_wgp_ptr = sFifo + rest;
+   gx_in_flush = 1;
+   gx_flushes++;
+   if (noDecode) { gx_in_flush = 0; return; }
+   const uint8_t *buf = data, *end = data + len;
+   if (sWLen) { // continue a split primitive
+      if (sWLen + len > FIFO_SIZE) sWLen = 0; // should not happen: resynchronise
+      memcpy(sWFifo + sWLen, data, len);
+      sWLen += len;
+      buf = sWFifo; end = sWFifo + sWLen;
    }
+   const uint8_t *stop = parse(buf, end);
+   uint32_t rest = (uint32_t)(end - stop);
+   if (rest && rest <= FIFO_SIZE) memmove(sWFifo, stop, rest);
+   sWLen = rest <= FIFO_SIZE ? rest : 0;
    gx_in_flush = 0;
+}
+
+static void q_process(void)
+{
+   while (sQTail != sQHead) {
+      q_barrier();
+      QRec *r = (QRec *)(sQ + sQTail);
+      if (r->type == QR_WRAP) { q_barrier(); sQTail = 0; continue; }
+      if (r->type == QR_RAW) w_raw((const uint8_t *)(r + 1), r->len);
+      else if (r->type == QR_CALL) r->fn(r + 1);
+      uint32_t next = sQTail + r->size;
+      q_barrier();
+      sQTail = next;
+   }
+}
+
+extern volatile uint64_t gx_worker_ticks;
+static int worker_main(int argc, const char **argv)
+{
+   for (;;) {
+      if (sQTail == sQHead) { OSSleepTicks(OSMicrosecondsToTicks(50)); continue; }
+      OSTime t0 = OSGetSystemTime();
+      q_process();
+      gx_worker_ticks += (uint64_t)(OSGetSystemTime() - t0);
+   }
+   return 0;
+}
+
+uint32_t gx_queue_waits(void) { return sQWaits; }
+volatile uint64_t gx_worker_ticks;
+
+static void q_init(void)
+{
+   sQ = MEMAllocFromDefaultHeapEx(QSIZE, 64);
+   sWFifo = MEMAllocFromDefaultHeapEx(FIFO_SIZE + 0x10000, 64);
+   if (!sQ || !sWFifo) OSFatal("Rayman port: out of memory for the GX queue");
+   sInline = port_cfg("gxinline");
+   if (sInline) { WHBLogPrintf("[gx] replaying GX on the game thread (gxinline)"); return; }
+   static uint8_t stack[0x20000] __attribute__((aligned(16)));
+   OSCreateThread(&sWorker, (OSThreadEntryPointFn)worker_main, 0, NULL, stack + sizeof(stack), sizeof(stack), 10,
+                  OS_THREAD_ATTRIB_AFFINITY_CPU0);
+   OSSetThreadName(&sWorker, "Rayman GX worker");
+   OSResumeThread(&sWorker);
+   WHBLogPrintf("[gx] GX worker started on CPU0");
+}
+
+// ---------------------------------------------------------------------------------------
+// Game-side shadows for the getters (answered without waiting for the worker)
+// ---------------------------------------------------------------------------------------
+static uint8_t sShVcd[VA_MAX];
+static int sShNbt;
+static float sShProjv[7], sShVp[6];
+static uint32_t sShCull;
+static void sh_vcd(uint32_t attr, uint32_t type)
+{
+   if (attr == VA_NBT) { sShVcd[VA_NRM] = (uint8_t)type; sShNbt = type != AT_NONE; }
+   else if (attr < VA_MAX) { sShVcd[attr] = (uint8_t)type; if (attr == VA_NRM) sShNbt = 0; }
+}
+static void sh_proj(const float *mtx, uint32_t type)
+{
+   float *v = sShProjv;
+   v[0] = (float)type;
+   v[1] = mtx[0]; v[3] = mtx[5]; v[5] = mtx[10]; v[6] = mtx[11];
+   if (type == 0) { v[2] = mtx[2]; v[4] = mtx[6]; } else { v[2] = mtx[3]; v[4] = mtx[7]; }
+}
+static void sh_vp(float l, float t, float w, float h, float n, float f)
+{
+   sShVp[0] = l; sShVp[1] = t; sShVp[2] = w; sShVp[3] = h; sShVp[4] = n; sShVp[5] = f;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -862,9 +1014,9 @@ uint32_t wii_GXEndDisplayList(void)
    return n;
 }
 
-void wii_GXCallDisplayList(const void *list, uint32_t nbytes)
+static void w_GXCallDisplayList(const void *list, uint32_t nbytes)
 {
-   FLUSH();
+   WK();
    TRACE_N(8, "[gx] GXCallDisplayList %p %u bytes", list, (unsigned)nbytes);
    sStats[6]++;
    sParseFromDL = 1;
@@ -890,7 +1042,7 @@ void wii_GXRestoreWriteGatherPipe(void)
 }
 
 void wii_GXFlush(void) { FLUSH(); }
-void wii_GXDrawDone(void) { FLUSH(); }
+void wii_GXDrawDone(void) { FLUSH(); gx_sync(); }
 void wii_GXSetDrawDone(void) { FLUSH(); }
 void wii_GXPixModeSync(void) { FLUSH(); }
 void wii_GXInvalidateVtxCache(void) {}
@@ -905,38 +1057,29 @@ static void set_vcd(uint32_t attr, uint32_t type)
    else if (attr < VA_MAX) { G.vcd[attr] = (uint8_t)type; if (attr == VA_NRM) G.nbt = 0; }
 }
 
-void wii_GXSetVtxDesc(uint32_t attr, uint32_t type) { FLUSH(); set_vcd(attr, type); }
-void wii_GXClearVtxDesc(void) { FLUSH(); memset(G.vcd, 0, sizeof(G.vcd)); G.nbt = 0; }
+static void w_GXSetVtxDesc(uint32_t attr, uint32_t type) { WK(); set_vcd(attr, type); }
+static void w_GXClearVtxDesc(void) { WK(); memset(G.vcd, 0, sizeof(G.vcd)); G.nbt = 0; }
 
 typedef struct { uint32_t attr, type; } VtxDesc;
-void wii_GXSetVtxDescv(const VtxDesc *l)
+static void w_GXSetVtxDescv(const VtxDesc *l)
 {
-   FLUSH();
+   WK();
    for (; l->attr != VA_NULL; l++) set_vcd(l->attr, l->type);
 }
 
-void wii_GXGetVtxDescv(VtxDesc *l)
-{
-   for (uint32_t a = 0; a < VA_MAX; a++) {
-      l[a].attr = a;
-      l[a].type = a == VA_NBT ? (G.nbt ? G.vcd[VA_NRM] : 0) : (a == VA_NRM && G.nbt) ? 0 : (a < VA_MAX ? G.vcd[a] : 0);
-   }
-   l[VA_MAX].attr = VA_NULL;
-   l[VA_MAX].type = 0;
-}
 
-void wii_GXSetVtxAttrFmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint8_t frac)
+static void w_GXSetVtxAttrFmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint8_t frac)
 {
-   FLUSH();
+   WK();
    if (fmt > 7) return;
    if (attr == VA_NBT) { attr = VA_NRM; cnt = 1; }
    if (attr >= VA_MAX) return;
    G.vat[fmt][attr] = (Vat){(uint8_t)cnt, (uint8_t)type, frac};
 }
 
-void wii_GXSetArray(uint32_t attr, const void *base, uint8_t stride)
+static void w_GXSetArray(uint32_t attr, const void *base, uint8_t stride)
 {
-   FLUSH();
+   WK();
    if (attr == VA_NBT) attr = VA_NRM;
    if (attr < VA_MAX) { G.array[attr] = base; G.stride[attr] = stride; }
 }
@@ -944,17 +1087,17 @@ void wii_GXSetArray(uint32_t attr, const void *base, uint8_t stride)
 // ---------------------------------------------------------------------------------------
 // Transforms
 // ---------------------------------------------------------------------------------------
-void wii_GXLoadPosMtxImm(const float *m, uint32_t id)
+static void w_GXLoadPosMtxImm(const float *m, uint32_t id)
 {
-   FLUSH();
+   WK();
    if (id / 3 < 10) memcpy(G.posMtx[id / 3], m, 12 * sizeof(float));
 }
 
-void wii_GXSetCurrentMtx(uint32_t id) { FLUSH(); G.curPosMtx = id / 3; }
+static void w_GXSetCurrentMtx(uint32_t id) { WK(); G.curPosMtx = id / 3; }
 
-void wii_GXLoadTexMtxImm(const float *m, uint32_t id, uint32_t type)
+static void w_GXLoadTexMtxImm(const float *m, uint32_t id, uint32_t type)
 {
-   FLUSH();
+   WK();
    if (id >= 64 && id < 124) { // post-transform matrix (always 3x4)
       memcpy(G.postMtx[(id - 64) / 3], m, 12 * sizeof(float));
       return;
@@ -967,18 +1110,18 @@ void wii_GXLoadTexMtxImm(const float *m, uint32_t id, uint32_t type)
    G.texMtxType[i] = (uint8_t)type;
 }
 
-void wii_GXSetTexCoordGen2(uint32_t dst, uint32_t func, uint32_t src, uint32_t mtx, int normalize, uint32_t post)
+static void w_GXSetTexCoordGen2(uint32_t dst, uint32_t func, uint32_t src, uint32_t mtx, int normalize, uint32_t post)
 {
-   FLUSH();
+   WK();
    if (dst < 8) G.texGen[dst] = (TexGen){(uint8_t)func, (uint8_t)src, (uint8_t)mtx, (uint8_t)post, (uint8_t)(normalize != 0)};
 }
 
-void wii_GXSetNumTexGens(uint8_t n) { FLUSH(); G.numTexGens = n; }
+static void w_GXSetNumTexGens(uint8_t n) { WK(); G.numTexGens = n; }
 // Manual scaling: the hardware uses s * ss texels instead of normalising by the texture size
 // (Bink's YUV planes share coordinates across differently sized textures).
-void wii_GXSetTexCoordScaleManually(uint32_t coord, int enable, uint16_t ss, uint16_t ts)
+static void w_GXSetTexCoordScaleManually(uint32_t coord, int enable, uint16_t ss, uint16_t ts)
 {
-   FLUSH();
+   WK();
    if (coord < 8) { sManual[coord].on = enable != 0; sManual[coord].ss = ss; sManual[coord].ts = ts; DIRTY(); }
 }
 void wii_GXSetTexCoordCylWrap(uint32_t coord, int s, int t) { FLUSH(); }
@@ -992,9 +1135,9 @@ static void proj_from_params(void)
    else { m[3] = v[2]; m[7] = v[4]; m[15] = 1; }             // orthographic
 }
 
-void wii_GXSetProjection(const float *mtx, uint32_t type)
+static void w_GXSetProjection(const float *mtx, uint32_t type)
 {
-   FLUSH();
+   WK();
    float *v = G.projv;
    v[0] = (float)type;
    v[1] = mtx[0]; v[3] = mtx[5]; v[5] = mtx[10]; v[6] = mtx[11];
@@ -1003,22 +1146,19 @@ void wii_GXSetProjection(const float *mtx, uint32_t type)
    DIRTY();
 }
 
-void wii_GXSetProjectionv(const float *p) { FLUSH(); memcpy(G.projv, p, 7 * sizeof(float)); proj_from_params(); DIRTY(); }
-void wii_GXGetProjectionv(float *p) { memcpy(p, G.projv, 7 * sizeof(float)); }
+static void w_GXSetProjectionv(const float *p) { WK(); memcpy(G.projv, p, 7 * sizeof(float)); proj_from_params(); DIRTY(); }
 
-void wii_GXSetViewport(float l, float t, float w, float h, float n, float f)
+static void w_GXSetViewport(float l, float t, float w, float h, float n, float f)
 {
-   FLUSH();
+   WK();
    float *v = sCur.viewport;
    v[0] = l; v[1] = t; v[2] = w; v[3] = h; v[4] = n; v[5] = f;
    DIRTY();
 }
-void wii_GXSetViewportJitter(float l, float t, float w, float h, float n, float f, uint32_t field) { wii_GXSetViewport(l, t, w, h, n, f); }
-void wii_GXGetViewportv(float *v) { memcpy(v, sCur.viewport, 6 * sizeof(float)); }
 
-void wii_GXSetScissor(uint32_t l, uint32_t t, uint32_t w, uint32_t h)
+static void w_GXSetScissor(uint32_t l, uint32_t t, uint32_t w, uint32_t h)
 {
-   FLUSH();
+   WK();
    sCur.scissor[0] = (int32_t)l; sCur.scissor[1] = (int32_t)t; sCur.scissor[2] = (int32_t)w; sCur.scissor[3] = (int32_t)h;
    DIRTY();
 }
@@ -1026,11 +1166,11 @@ void wii_GXSetScissor(uint32_t l, uint32_t t, uint32_t w, uint32_t h)
 // ---------------------------------------------------------------------------------------
 // Colour channels
 // ---------------------------------------------------------------------------------------
-void wii_GXSetNumChans(uint8_t n) { FLUSH(); G.numChans = n; }
+static void w_GXSetNumChans(uint8_t n) { WK(); G.numChans = n; }
 
-void wii_GXSetChanCtrl(uint32_t chan, int enable, uint32_t ambSrc, uint32_t matSrc, uint32_t lights, uint32_t diff, uint32_t attn)
+static void w_GXSetChanCtrl(uint32_t chan, int enable, uint32_t ambSrc, uint32_t matSrc, uint32_t lights, uint32_t diff, uint32_t attn)
 {
-   FLUSH();
+   WK();
    ChanCtrl c = {(uint8_t)(enable != 0), (uint8_t)ambSrc, (uint8_t)matSrc};
    if (chan < 4) G.chan[chan] = c;
    else if (chan == 4 || chan == 5) G.chan[(chan - 4) * 2] = G.chan[(chan - 4) * 2 + 1] = c;
@@ -1050,37 +1190,37 @@ static void chan_color(float dst[2][4], uint32_t chan, const uint8_t *c)
    }
 }
 
-void wii_GXSetChanMatColor(uint32_t chan, const uint8_t *c) { FLUSH(); chan_color(G.mat, chan, c); }
-void wii_GXSetChanAmbColor(uint32_t chan, const uint8_t *c) { FLUSH(); chan_color(G.amb, chan, c); }
+static void w_GXSetChanMatColor(uint32_t chan, const uint8_t *c) { WK(); chan_color(G.mat, chan, c); }
+static void w_GXSetChanAmbColor(uint32_t chan, const uint8_t *c) { WK(); chan_color(G.amb, chan, c); }
 
 // ---------------------------------------------------------------------------------------
 // TEV
 // ---------------------------------------------------------------------------------------
 #define STAGE_OK(s) ((s) < GX_MAX_STAGES)
-void wii_GXSetNumTevStages(uint8_t n) { FLUSH(); sCur.misc[0][0] = n; DIRTY(); }
-void wii_GXSetTevOp(uint32_t s, uint32_t mode) { FLUSH(); if (STAGE_OK(s)) { tev_op(s, mode); DIRTY(); } }
+static void w_GXSetNumTevStages(uint8_t n) { WK(); sCur.misc[0][0] = n; DIRTY(); }
+static void w_GXSetTevOp(uint32_t s, uint32_t mode) { WK(); if (STAGE_OK(s)) { tev_op(s, mode); DIRTY(); } }
 
-void wii_GXSetTevColorIn(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+static void w_GXSetTevColorIn(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
-   FLUSH();
+   WK();
    if (!STAGE_OK(s)) return;
    float *ci = sCur.stage[s * 7 + 0];
    ci[0] = a; ci[1] = b; ci[2] = c; ci[3] = d;
    DIRTY();
 }
 
-void wii_GXSetTevAlphaIn(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+static void w_GXSetTevAlphaIn(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
-   FLUSH();
+   WK();
    if (!STAGE_OK(s)) return;
    float *ai = sCur.stage[s * 7 + 1];
    ai[0] = a; ai[1] = b; ai[2] = c; ai[3] = d;
    DIRTY();
 }
 
-void wii_GXSetTevColorOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale, int clamp, uint32_t out)
+static void w_GXSetTevColorOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale, int clamp, uint32_t out)
 {
-   FLUSH();
+   WK();
    if (!STAGE_OK(s)) return;
    float *o = sCur.stage[s * 7 + 2];
    o[0] = op; o[1] = bias; o[2] = scale; o[3] = clamp ? 1 : 0;
@@ -1088,9 +1228,9 @@ void wii_GXSetTevColorOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale,
    DIRTY();
 }
 
-void wii_GXSetTevAlphaOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale, int clamp, uint32_t out)
+static void w_GXSetTevAlphaOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale, int clamp, uint32_t out)
 {
-   FLUSH();
+   WK();
    if (!STAGE_OK(s)) return;
    float *o = sCur.stage[s * 7 + 3];
    o[0] = op; o[1] = bias; o[2] = scale; o[3] = clamp ? 1 : 0;
@@ -1098,21 +1238,21 @@ void wii_GXSetTevAlphaOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale,
    DIRTY();
 }
 
-void wii_GXSetTevColor(uint32_t id, const uint8_t *c) { FLUSH(); if (id < 4) { color_from(sCur.regs[id], c); DIRTY(); } }
-void wii_GXSetTevColorS10(uint32_t id, const int16_t *c)
+static void w_GXSetTevColor(uint32_t id, const uint8_t *c) { WK(); if (id < 4) { color_from(sCur.regs[id], c); DIRTY(); } }
+static void w_GXSetTevColorS10(uint32_t id, const int16_t *c)
 {
-   FLUSH();
+   WK();
    if (id >= 4) return;
    for (int i = 0; i < 4; i++) sCur.regs[id][i] = c[i] / 255.0f;
    DIRTY();
 }
-void wii_GXSetTevKColor(uint32_t id, const uint8_t *c) { FLUSH(); if (id < 4) { color_from(sCur.konst[id], c); DIRTY(); } }
-void wii_GXSetTevKColorSel(uint32_t s, uint32_t sel) { FLUSH(); if (STAGE_OK(s)) { sCur.stage[s * 7 + 4][2] = sel; DIRTY(); } }
-void wii_GXSetTevKAlphaSel(uint32_t s, uint32_t sel) { FLUSH(); if (STAGE_OK(s)) { sCur.stage[s * 7 + 4][3] = sel; DIRTY(); } }
+static void w_GXSetTevKColor(uint32_t id, const uint8_t *c) { WK(); if (id < 4) { color_from(sCur.konst[id], c); DIRTY(); } }
+static void w_GXSetTevKColorSel(uint32_t s, uint32_t sel) { WK(); if (STAGE_OK(s)) { sCur.stage[s * 7 + 4][2] = sel; DIRTY(); } }
+static void w_GXSetTevKAlphaSel(uint32_t s, uint32_t sel) { WK(); if (STAGE_OK(s)) { sCur.stage[s * 7 + 4][3] = sel; DIRTY(); } }
 
-void wii_GXSetTevOrder(uint32_t s, uint32_t coord, uint32_t map, uint32_t chan)
+static void w_GXSetTevOrder(uint32_t s, uint32_t coord, uint32_t map, uint32_t chan)
 {
-   FLUSH();
+   WK();
    if (!STAGE_OK(s)) return;
    float *t = sCur.stage[s * 7 + 5];
    int slot = (map == 0xFF || (map & 0x100)) ? -1 : (int)(map & 7);
@@ -1124,28 +1264,28 @@ void wii_GXSetTevOrder(uint32_t s, uint32_t coord, uint32_t map, uint32_t chan)
    DIRTY();
 }
 
-void wii_GXSetTevSwapMode(uint32_t s, uint32_t ras, uint32_t tex)
+static void w_GXSetTevSwapMode(uint32_t s, uint32_t ras, uint32_t tex)
 {
-   FLUSH();
+   WK();
    if (!STAGE_OK(s)) return;
    sCur.stage[s * 7 + 5][3] = ras & 3;
    sCur.stage[s * 7 + 6][0] = tex & 3;
    DIRTY();
 }
 
-void wii_GXSetTevSwapModeTable(uint32_t table, uint32_t r, uint32_t g, uint32_t b, uint32_t a)
+static void w_GXSetTevSwapModeTable(uint32_t table, uint32_t r, uint32_t g, uint32_t b, uint32_t a)
 {
-   FLUSH();
+   WK();
    if (table >= 4) return;
    float *t = sCur.swap[table];
    t[0] = r; t[1] = g; t[2] = b; t[3] = a;
    DIRTY();
 }
 
-void wii_GXSetTevIndirect(uint32_t s, uint32_t ind, uint32_t fmt, uint32_t bias, uint32_t mtx, uint32_t ws, uint32_t wt,
+static void w_GXSetTevIndirect(uint32_t s, uint32_t ind, uint32_t fmt, uint32_t bias, uint32_t mtx, uint32_t ws, uint32_t wt,
                           int addPrev, int utcLod, uint32_t alphaSel)
 {
-   FLUSH();
+   WK();
    if (s >= GX_MAX_STAGES) return;
    sCur.indStage[s] = (uint8_t)(ind & 3); sCur.indFmt[s] = (uint8_t)(fmt & 3); sCur.indBias[s] = (uint8_t)(bias & 7);
    sCur.indMtx[s] = (uint8_t)(mtx & 15); sCur.indWrapS[s] = (uint8_t)(ws & 7); sCur.indWrapT[s] = (uint8_t)(wt & 7);
@@ -1155,18 +1295,18 @@ void wii_GXSetTevIndirect(uint32_t s, uint32_t ind, uint32_t fmt, uint32_t bias,
                              (unsigned)bias, (unsigned)mtx, (unsigned)ws, (unsigned)wt, addPrev);
    DIRTY();
 }
-void wii_GXSetTevDirect(uint32_t s) { wii_GXSetTevIndirect(s, 0, 0, 0, 0, 0, 0, 0, 0, 0); }
-void wii_GXSetNumIndStages(uint8_t n) { FLUSH(); sCur.numInd = n & 7; DIRTY(); }
-void wii_GXSetIndTexOrder(uint32_t s, uint32_t coord, uint32_t map)
+static void w_GXSetTevDirect(uint32_t s) { w_GXSetTevIndirect(s, 0, 0, 0, 0, 0, 0, 0, 0, 0); }
+static void w_GXSetNumIndStages(uint8_t n) { WK(); sCur.numInd = n & 7; DIRTY(); }
+static void w_GXSetIndTexOrder(uint32_t s, uint32_t coord, uint32_t map)
 {
-   FLUSH();
+   WK();
    if (s >= 4) return;
    sCur.indCoord[s] = (uint8_t)(coord & 7); sCur.indMap[s] = (uint8_t)(map & 7);
    DIRTY();
 }
-void wii_GXSetIndTexMtx(uint32_t id, const float *m, int8_t scale)
+static void w_GXSetIndTexMtx(uint32_t id, const float *m, int8_t scale)
 {
-   FLUSH();
+   WK();
    uint32_t i = id >= 1 && id <= 3 ? id - 1 : 9; // only the static matrices
    if (i < 3) {
       for (int k = 0; k < 6; k++) sCur.indM[i][k] = m[k];
@@ -1177,9 +1317,9 @@ void wii_GXSetIndTexMtx(uint32_t id, const float *m, int8_t scale)
    DIRTY();
 }
 
-void wii_GXSetAlphaCompare(uint32_t c0, uint8_t r0, uint32_t op, uint32_t c1, uint8_t r1)
+static void w_GXSetAlphaCompare(uint32_t c0, uint8_t r0, uint32_t op, uint32_t c1, uint8_t r1)
 {
-   FLUSH();
+   WK();
    sCur.misc[0][1] = c0; sCur.misc[0][2] = r0 / 255.0f; sCur.misc[0][3] = op;
    sCur.misc[1][0] = c1; sCur.misc[1][1] = r1 / 255.0f;
    DIRTY();
@@ -1188,22 +1328,21 @@ void wii_GXSetAlphaCompare(uint32_t c0, uint8_t r0, uint32_t op, uint32_t c1, ui
 // ---------------------------------------------------------------------------------------
 // Pixel engine
 // ---------------------------------------------------------------------------------------
-void wii_GXSetBlendMode(uint32_t type, uint32_t src, uint32_t dst, uint32_t op)
+static void w_GXSetBlendMode(uint32_t type, uint32_t src, uint32_t dst, uint32_t op)
 {
-   FLUSH();
+   WK();
    sCur.blendType = (uint8_t)type; sCur.blendSrc = (uint8_t)src; sCur.blendDst = (uint8_t)dst; sCur.logicOp = (uint8_t)op;
    DIRTY();
 }
-void wii_GXSetColorUpdate(int on) { FLUSH(); sCur.colorUpdate = on != 0; DIRTY(); }
-void wii_GXSetAlphaUpdate(int on) { FLUSH(); sCur.alphaUpdate = on != 0; DIRTY(); }
-void wii_GXSetZMode(int enable, uint32_t func, int update)
+static void w_GXSetColorUpdate(int on) { WK(); sCur.colorUpdate = on != 0; DIRTY(); }
+static void w_GXSetAlphaUpdate(int on) { WK(); sCur.alphaUpdate = on != 0; DIRTY(); }
+static void w_GXSetZMode(int enable, uint32_t func, int update)
 {
-   FLUSH();
+   WK();
    sCur.zEnable = enable != 0; sCur.zFunc = (uint8_t)func; sCur.zUpdate = update != 0;
    DIRTY();
 }
-void wii_GXSetCullMode(uint32_t mode) { FLUSH(); sCur.cull = (uint8_t)mode; DIRTY(); }
-void wii_GXGetCullMode(uint32_t *mode) { *mode = sCur.cull; }
+static void w_GXSetCullMode(uint32_t mode) { WK(); sCur.cull = (uint8_t)mode; DIRTY(); }
 void wii_GXSetZCompLoc(int before) { FLUSH(); }
 void wii_GXSetZTexture(uint32_t op, uint32_t fmt, uint32_t bias) { FLUSH(); }
 void wii_GXSetFog(uint32_t type, float a, float b, float n, float f, const uint8_t *color) { FLUSH(); }
@@ -1244,9 +1383,9 @@ void wii_GXInitTexObjUserData(TexObj *o, void *ud) { o->userData = ud; }
 void *wii_GXGetTexObjData(const TexObj *o) { return (void *)o->key.image; }
 uint32_t wii_GXGetTexObjFmt(const TexObj *o) { return o->key.fmt; }
 
-void wii_GXLoadTexObj(const TexObj *o, uint32_t map)
+static void w_GXLoadTexObj(const TexObj *o, uint32_t map)
 {
-   FLUSH();
+   WK();
    if (map < GX_MAX_SLOTS) { sCur.tex[map] = o->key; DIRTY(); }
 }
 
@@ -1274,30 +1413,30 @@ int gx_is_render_texture(uint32_t addr)
 // ---------------------------------------------------------------------------------------
 // EFB copies
 // ---------------------------------------------------------------------------------------
-void wii_GXSetCopyClear(const uint8_t *rgba, uint32_t z)
+static void w_GXSetCopyClear(const uint8_t *rgba, uint32_t z)
 {
    G.copyClear = (uint32_t)rgba[0] << 24 | rgba[1] << 16 | rgba[2] << 8 | rgba[3];
    G.copyClearZ = z;
 }
 
-void wii_GXSetDispCopySrc(uint16_t l, uint16_t t, uint16_t w, uint16_t h)
+static void w_GXSetDispCopySrc(uint16_t l, uint16_t t, uint16_t w, uint16_t h)
 {
    G.dispSrc[0] = l; G.dispSrc[1] = t; G.dispSrc[2] = w; G.dispSrc[3] = h;
 }
 
-void wii_GXSetTexCopySrc(uint16_t l, uint16_t t, uint16_t w, uint16_t h)
+static void w_GXSetTexCopySrc(uint16_t l, uint16_t t, uint16_t w, uint16_t h)
 {
    G.texSrc[0] = l; G.texSrc[1] = t; G.texSrc[2] = w; G.texSrc[3] = h;
 }
 
-void wii_GXSetTexCopyDst(uint16_t w, uint16_t h, uint32_t fmt, int mip)
+static void w_GXSetTexCopyDst(uint16_t w, uint16_t h, uint32_t fmt, int mip)
 {
    G.texDst[0] = w; G.texDst[1] = h; G.texDstFmt = (uint8_t)fmt;
 }
 
-void wii_GXCopyTex(void *dest, int clear)
+static void w_GXCopyTex(void *dest, int clear)
 {
-   FLUSH();
+   WK();
    sStats[7]++;
    if (dest && !gx_is_render_texture((uint32_t)dest) && sNumRenderTex < RT_SLOTS / 2) {
       uint32_t i = ((uint32_t)dest >> 5) & (RT_SLOTS - 1);
@@ -1321,9 +1460,9 @@ static volatile uint32_t sCopyDisp;
 uint32_t port_gx_copy_disp(void) { return sCopyDisp; }
 uint32_t port_gx_copy_clear(void) { return G.copyClear; }
 
-void wii_GXCopyDisp(void *dest, int clear)
+static void w_GXCopyDisp(void *dest, int clear)
 {
-   FLUSH();
+   WK();
    sCopyDisp++;
    GxPacket *p = sFill;
    memcpy(p->dispSrc, G.dispSrc, sizeof(p->dispSrc));
@@ -1344,6 +1483,510 @@ int gx_describe(char *buf, int size)
    extern volatile uint32_t gx_nan_verts;
    return snprintf(buf, size, "gx: nan verts %u, render %s, last %s, %u calls, %u flushes%s, mode %s, stream %d bytes, prims %u, pkts %u",
                    (unsigned)gx_nan_verts, (const char *)gx_render_step, (const char *)gx_last_api, (unsigned)gx_api_calls, (unsigned)gx_flushes, gx_in_flush ? " (IN FLUSH)" : "",
-                   modes[sMode < 3 ? sMode : 0], sMode == MODE_FIFO ? (int)(port_wgp_ptr - sParse) : -1,
+                   modes[sMode < 3 ? sMode : 0], sMode == MODE_FIFO ? (int)(port_wgp_ptr - sFifo) : -1,
                    (unsigned)sStats[0], (unsigned)sStats[4]);
 }
+
+// ---------------------------------------------------------------------------------------
+// Game-side GX entry points: queue the call for the worker (generated, see the commit)
+// ---------------------------------------------------------------------------------------
+typedef struct { uint32_t attr; uint32_t type; } A_GXSetVtxDesc;
+static void R_GXSetVtxDesc(const void *p) { const A_GXSetVtxDesc *q_ = p; (void)q_; w_GXSetVtxDesc(q_->attr, q_->type); }
+void wii_GXSetVtxDesc(uint32_t attr, uint32_t type)
+{
+   FLUSH();
+   sh_vcd(attr, type);
+   A_GXSetVtxDesc *q_ = q_call(R_GXSetVtxDesc, sizeof(A_GXSetVtxDesc));
+   (void)q_; q_->attr = attr; q_->type = type;
+   Q_DONE();
+}
+typedef struct { uint32_t unused; } A_GXClearVtxDesc;
+static void R_GXClearVtxDesc(const void *p) { const A_GXClearVtxDesc *q_ = p; (void)q_; w_GXClearVtxDesc(); }
+void wii_GXClearVtxDesc(void)
+{
+   FLUSH();
+   memset(sShVcd, 0, sizeof(sShVcd)); sShNbt = 0;
+   A_GXClearVtxDesc *q_ = q_call(R_GXClearVtxDesc, sizeof(A_GXClearVtxDesc));
+   (void)q_; 
+   Q_DONE();
+}
+typedef struct { VtxDesc l[32]; } A_GXSetVtxDescv;
+static void R_GXSetVtxDescv(const void *p) { const A_GXSetVtxDescv *q_ = p; (void)q_; w_GXSetVtxDescv(q_->l); }
+void wii_GXSetVtxDescv(const VtxDesc *l)
+{
+   FLUSH();
+   A_GXSetVtxDescv *q_ = q_call(R_GXSetVtxDescv, sizeof(A_GXSetVtxDescv));
+   (void)q_; { int k = 0; for (; k < 31 && l[k].attr != VA_NULL; k++) q_->l[k] = l[k]; q_->l[k].attr = VA_NULL; q_->l[k].type = 0; for (int j = 0; j < k; j++) sh_vcd(l[j].attr, l[j].type); }
+   Q_DONE();
+}
+typedef struct { uint32_t fmt; uint32_t attr; uint32_t cnt; uint32_t type; uint8_t frac; } A_GXSetVtxAttrFmt;
+static void R_GXSetVtxAttrFmt(const void *p) { const A_GXSetVtxAttrFmt *q_ = p; (void)q_; w_GXSetVtxAttrFmt(q_->fmt, q_->attr, q_->cnt, q_->type, q_->frac); }
+void wii_GXSetVtxAttrFmt(uint32_t fmt, uint32_t attr, uint32_t cnt, uint32_t type, uint8_t frac)
+{
+   FLUSH();
+   A_GXSetVtxAttrFmt *q_ = q_call(R_GXSetVtxAttrFmt, sizeof(A_GXSetVtxAttrFmt));
+   (void)q_; q_->fmt = fmt; q_->attr = attr; q_->cnt = cnt; q_->type = type; q_->frac = frac;
+   Q_DONE();
+}
+typedef struct { uint32_t attr; const void * base; uint8_t stride; } A_GXSetArray;
+static void R_GXSetArray(const void *p) { const A_GXSetArray *q_ = p; (void)q_; w_GXSetArray(q_->attr, q_->base, q_->stride); }
+void wii_GXSetArray(uint32_t attr, const void * base, uint8_t stride)
+{
+   FLUSH();
+   A_GXSetArray *q_ = q_call(R_GXSetArray, sizeof(A_GXSetArray));
+   (void)q_; q_->attr = attr; q_->base = base; q_->stride = stride;
+   Q_DONE();
+}
+typedef struct { float m[12]; uint32_t id; } A_GXLoadPosMtxImm;
+static void R_GXLoadPosMtxImm(const void *p) { const A_GXLoadPosMtxImm *q_ = p; (void)q_; w_GXLoadPosMtxImm(q_->m, q_->id); }
+void wii_GXLoadPosMtxImm(const float *m, uint32_t id)
+{
+   FLUSH();
+   A_GXLoadPosMtxImm *q_ = q_call(R_GXLoadPosMtxImm, sizeof(A_GXLoadPosMtxImm));
+   (void)q_; memcpy(q_->m, m, sizeof(q_->m)); q_->id = id;
+   Q_DONE();
+}
+typedef struct { uint32_t id; } A_GXSetCurrentMtx;
+static void R_GXSetCurrentMtx(const void *p) { const A_GXSetCurrentMtx *q_ = p; (void)q_; w_GXSetCurrentMtx(q_->id); }
+void wii_GXSetCurrentMtx(uint32_t id)
+{
+   FLUSH();
+   A_GXSetCurrentMtx *q_ = q_call(R_GXSetCurrentMtx, sizeof(A_GXSetCurrentMtx));
+   (void)q_; q_->id = id;
+   Q_DONE();
+}
+typedef struct { float m[12]; uint32_t id; uint32_t type; } A_GXLoadTexMtxImm;
+static void R_GXLoadTexMtxImm(const void *p) { const A_GXLoadTexMtxImm *q_ = p; (void)q_; w_GXLoadTexMtxImm(q_->m, q_->id, q_->type); }
+void wii_GXLoadTexMtxImm(const float *m, uint32_t id, uint32_t type)
+{
+   FLUSH();
+   A_GXLoadTexMtxImm *q_ = q_call(R_GXLoadTexMtxImm, sizeof(A_GXLoadTexMtxImm));
+   (void)q_; memcpy(q_->m, m, (type == 1 ? 8 : 12) * sizeof(float)); q_->id = id; q_->type = type;
+   Q_DONE();
+}
+typedef struct { uint32_t dst; uint32_t func; uint32_t src; uint32_t mtx; int normalize; uint32_t post; } A_GXSetTexCoordGen2;
+static void R_GXSetTexCoordGen2(const void *p) { const A_GXSetTexCoordGen2 *q_ = p; (void)q_; w_GXSetTexCoordGen2(q_->dst, q_->func, q_->src, q_->mtx, q_->normalize, q_->post); }
+void wii_GXSetTexCoordGen2(uint32_t dst, uint32_t func, uint32_t src, uint32_t mtx, int normalize, uint32_t post)
+{
+   FLUSH();
+   A_GXSetTexCoordGen2 *q_ = q_call(R_GXSetTexCoordGen2, sizeof(A_GXSetTexCoordGen2));
+   (void)q_; q_->dst = dst; q_->func = func; q_->src = src; q_->mtx = mtx; q_->normalize = normalize; q_->post = post;
+   Q_DONE();
+}
+typedef struct { uint8_t n; } A_GXSetNumTexGens;
+static void R_GXSetNumTexGens(const void *p) { const A_GXSetNumTexGens *q_ = p; (void)q_; w_GXSetNumTexGens(q_->n); }
+void wii_GXSetNumTexGens(uint8_t n)
+{
+   FLUSH();
+   A_GXSetNumTexGens *q_ = q_call(R_GXSetNumTexGens, sizeof(A_GXSetNumTexGens));
+   (void)q_; q_->n = n;
+   Q_DONE();
+}
+typedef struct { uint32_t coord; int enable; uint16_t ss; uint16_t ts; } A_GXSetTexCoordScaleManually;
+static void R_GXSetTexCoordScaleManually(const void *p) { const A_GXSetTexCoordScaleManually *q_ = p; (void)q_; w_GXSetTexCoordScaleManually(q_->coord, q_->enable, q_->ss, q_->ts); }
+void wii_GXSetTexCoordScaleManually(uint32_t coord, int enable, uint16_t ss, uint16_t ts)
+{
+   FLUSH();
+   A_GXSetTexCoordScaleManually *q_ = q_call(R_GXSetTexCoordScaleManually, sizeof(A_GXSetTexCoordScaleManually));
+   (void)q_; q_->coord = coord; q_->enable = enable; q_->ss = ss; q_->ts = ts;
+   Q_DONE();
+}
+typedef struct { float mtx[16]; uint32_t type; } A_GXSetProjection;
+static void R_GXSetProjection(const void *p) { const A_GXSetProjection *q_ = p; (void)q_; w_GXSetProjection(q_->mtx, q_->type); }
+void wii_GXSetProjection(const float *mtx, uint32_t type)
+{
+   FLUSH();
+   sh_proj(mtx, type);
+   A_GXSetProjection *q_ = q_call(R_GXSetProjection, sizeof(A_GXSetProjection));
+   (void)q_; memcpy(q_->mtx, mtx, sizeof(q_->mtx)); q_->type = type;
+   Q_DONE();
+}
+typedef struct { float p[7]; } A_GXSetProjectionv;
+static void R_GXSetProjectionv(const void *p) { const A_GXSetProjectionv *q_ = p; (void)q_; w_GXSetProjectionv(q_->p); }
+void wii_GXSetProjectionv(const float *p)
+{
+   FLUSH();
+   memcpy(sShProjv, p, sizeof(sShProjv));
+   A_GXSetProjectionv *q_ = q_call(R_GXSetProjectionv, sizeof(A_GXSetProjectionv));
+   (void)q_; memcpy(q_->p, p, sizeof(q_->p));
+   Q_DONE();
+}
+typedef struct { float l; float t; float w; float h; float n; float f; } A_GXSetViewport;
+static void R_GXSetViewport(const void *p) { const A_GXSetViewport *q_ = p; (void)q_; w_GXSetViewport(q_->l, q_->t, q_->w, q_->h, q_->n, q_->f); }
+void wii_GXSetViewport(float l, float t, float w, float h, float n, float f)
+{
+   FLUSH();
+   sh_vp(l, t, w, h, n, f);
+   A_GXSetViewport *q_ = q_call(R_GXSetViewport, sizeof(A_GXSetViewport));
+   (void)q_; q_->l = l; q_->t = t; q_->w = w; q_->h = h; q_->n = n; q_->f = f;
+   Q_DONE();
+}
+typedef struct { uint32_t l; uint32_t t; uint32_t w; uint32_t h; } A_GXSetScissor;
+static void R_GXSetScissor(const void *p) { const A_GXSetScissor *q_ = p; (void)q_; w_GXSetScissor(q_->l, q_->t, q_->w, q_->h); }
+void wii_GXSetScissor(uint32_t l, uint32_t t, uint32_t w, uint32_t h)
+{
+   FLUSH();
+   A_GXSetScissor *q_ = q_call(R_GXSetScissor, sizeof(A_GXSetScissor));
+   (void)q_; q_->l = l; q_->t = t; q_->w = w; q_->h = h;
+   Q_DONE();
+}
+typedef struct { uint8_t n; } A_GXSetNumChans;
+static void R_GXSetNumChans(const void *p) { const A_GXSetNumChans *q_ = p; (void)q_; w_GXSetNumChans(q_->n); }
+void wii_GXSetNumChans(uint8_t n)
+{
+   FLUSH();
+   A_GXSetNumChans *q_ = q_call(R_GXSetNumChans, sizeof(A_GXSetNumChans));
+   (void)q_; q_->n = n;
+   Q_DONE();
+}
+typedef struct { uint32_t chan; int enable; uint32_t ambSrc; uint32_t matSrc; uint32_t lights; uint32_t diff; uint32_t attn; } A_GXSetChanCtrl;
+static void R_GXSetChanCtrl(const void *p) { const A_GXSetChanCtrl *q_ = p; (void)q_; w_GXSetChanCtrl(q_->chan, q_->enable, q_->ambSrc, q_->matSrc, q_->lights, q_->diff, q_->attn); }
+void wii_GXSetChanCtrl(uint32_t chan, int enable, uint32_t ambSrc, uint32_t matSrc, uint32_t lights, uint32_t diff, uint32_t attn)
+{
+   FLUSH();
+   A_GXSetChanCtrl *q_ = q_call(R_GXSetChanCtrl, sizeof(A_GXSetChanCtrl));
+   (void)q_; q_->chan = chan; q_->enable = enable; q_->ambSrc = ambSrc; q_->matSrc = matSrc; q_->lights = lights; q_->diff = diff; q_->attn = attn;
+   Q_DONE();
+}
+typedef struct { uint32_t chan; uint8_t c[4]; } A_GXSetChanMatColor;
+static void R_GXSetChanMatColor(const void *p) { const A_GXSetChanMatColor *q_ = p; (void)q_; w_GXSetChanMatColor(q_->chan, q_->c); }
+void wii_GXSetChanMatColor(uint32_t chan, const uint8_t *c)
+{
+   FLUSH();
+   A_GXSetChanMatColor *q_ = q_call(R_GXSetChanMatColor, sizeof(A_GXSetChanMatColor));
+   (void)q_; q_->chan = chan; memcpy(q_->c, c, sizeof(q_->c));
+   Q_DONE();
+}
+typedef struct { uint32_t chan; uint8_t c[4]; } A_GXSetChanAmbColor;
+static void R_GXSetChanAmbColor(const void *p) { const A_GXSetChanAmbColor *q_ = p; (void)q_; w_GXSetChanAmbColor(q_->chan, q_->c); }
+void wii_GXSetChanAmbColor(uint32_t chan, const uint8_t *c)
+{
+   FLUSH();
+   A_GXSetChanAmbColor *q_ = q_call(R_GXSetChanAmbColor, sizeof(A_GXSetChanAmbColor));
+   (void)q_; q_->chan = chan; memcpy(q_->c, c, sizeof(q_->c));
+   Q_DONE();
+}
+typedef struct { uint8_t n; } A_GXSetNumTevStages;
+static void R_GXSetNumTevStages(const void *p) { const A_GXSetNumTevStages *q_ = p; (void)q_; w_GXSetNumTevStages(q_->n); }
+void wii_GXSetNumTevStages(uint8_t n)
+{
+   FLUSH();
+   A_GXSetNumTevStages *q_ = q_call(R_GXSetNumTevStages, sizeof(A_GXSetNumTevStages));
+   (void)q_; q_->n = n;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t mode; } A_GXSetTevOp;
+static void R_GXSetTevOp(const void *p) { const A_GXSetTevOp *q_ = p; (void)q_; w_GXSetTevOp(q_->s, q_->mode); }
+void wii_GXSetTevOp(uint32_t s, uint32_t mode)
+{
+   FLUSH();
+   A_GXSetTevOp *q_ = q_call(R_GXSetTevOp, sizeof(A_GXSetTevOp));
+   (void)q_; q_->s = s; q_->mode = mode;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t a; uint32_t b; uint32_t c; uint32_t d; } A_GXSetTevColorIn;
+static void R_GXSetTevColorIn(const void *p) { const A_GXSetTevColorIn *q_ = p; (void)q_; w_GXSetTevColorIn(q_->s, q_->a, q_->b, q_->c, q_->d); }
+void wii_GXSetTevColorIn(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+   FLUSH();
+   A_GXSetTevColorIn *q_ = q_call(R_GXSetTevColorIn, sizeof(A_GXSetTevColorIn));
+   (void)q_; q_->s = s; q_->a = a; q_->b = b; q_->c = c; q_->d = d;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t a; uint32_t b; uint32_t c; uint32_t d; } A_GXSetTevAlphaIn;
+static void R_GXSetTevAlphaIn(const void *p) { const A_GXSetTevAlphaIn *q_ = p; (void)q_; w_GXSetTevAlphaIn(q_->s, q_->a, q_->b, q_->c, q_->d); }
+void wii_GXSetTevAlphaIn(uint32_t s, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+   FLUSH();
+   A_GXSetTevAlphaIn *q_ = q_call(R_GXSetTevAlphaIn, sizeof(A_GXSetTevAlphaIn));
+   (void)q_; q_->s = s; q_->a = a; q_->b = b; q_->c = c; q_->d = d;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t op; uint32_t bias; uint32_t scale; int clamp; uint32_t out; } A_GXSetTevColorOp;
+static void R_GXSetTevColorOp(const void *p) { const A_GXSetTevColorOp *q_ = p; (void)q_; w_GXSetTevColorOp(q_->s, q_->op, q_->bias, q_->scale, q_->clamp, q_->out); }
+void wii_GXSetTevColorOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale, int clamp, uint32_t out)
+{
+   FLUSH();
+   A_GXSetTevColorOp *q_ = q_call(R_GXSetTevColorOp, sizeof(A_GXSetTevColorOp));
+   (void)q_; q_->s = s; q_->op = op; q_->bias = bias; q_->scale = scale; q_->clamp = clamp; q_->out = out;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t op; uint32_t bias; uint32_t scale; int clamp; uint32_t out; } A_GXSetTevAlphaOp;
+static void R_GXSetTevAlphaOp(const void *p) { const A_GXSetTevAlphaOp *q_ = p; (void)q_; w_GXSetTevAlphaOp(q_->s, q_->op, q_->bias, q_->scale, q_->clamp, q_->out); }
+void wii_GXSetTevAlphaOp(uint32_t s, uint32_t op, uint32_t bias, uint32_t scale, int clamp, uint32_t out)
+{
+   FLUSH();
+   A_GXSetTevAlphaOp *q_ = q_call(R_GXSetTevAlphaOp, sizeof(A_GXSetTevAlphaOp));
+   (void)q_; q_->s = s; q_->op = op; q_->bias = bias; q_->scale = scale; q_->clamp = clamp; q_->out = out;
+   Q_DONE();
+}
+typedef struct { uint32_t id; uint8_t c[4]; } A_GXSetTevColor;
+static void R_GXSetTevColor(const void *p) { const A_GXSetTevColor *q_ = p; (void)q_; w_GXSetTevColor(q_->id, q_->c); }
+void wii_GXSetTevColor(uint32_t id, const uint8_t *c)
+{
+   FLUSH();
+   A_GXSetTevColor *q_ = q_call(R_GXSetTevColor, sizeof(A_GXSetTevColor));
+   (void)q_; q_->id = id; memcpy(q_->c, c, sizeof(q_->c));
+   Q_DONE();
+}
+typedef struct { uint32_t id; int16_t c[4]; } A_GXSetTevColorS10;
+static void R_GXSetTevColorS10(const void *p) { const A_GXSetTevColorS10 *q_ = p; (void)q_; w_GXSetTevColorS10(q_->id, q_->c); }
+void wii_GXSetTevColorS10(uint32_t id, const int16_t *c)
+{
+   FLUSH();
+   A_GXSetTevColorS10 *q_ = q_call(R_GXSetTevColorS10, sizeof(A_GXSetTevColorS10));
+   (void)q_; q_->id = id; memcpy(q_->c, c, sizeof(q_->c));
+   Q_DONE();
+}
+typedef struct { uint32_t id; uint8_t c[4]; } A_GXSetTevKColor;
+static void R_GXSetTevKColor(const void *p) { const A_GXSetTevKColor *q_ = p; (void)q_; w_GXSetTevKColor(q_->id, q_->c); }
+void wii_GXSetTevKColor(uint32_t id, const uint8_t *c)
+{
+   FLUSH();
+   A_GXSetTevKColor *q_ = q_call(R_GXSetTevKColor, sizeof(A_GXSetTevKColor));
+   (void)q_; q_->id = id; memcpy(q_->c, c, sizeof(q_->c));
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t sel; } A_GXSetTevKColorSel;
+static void R_GXSetTevKColorSel(const void *p) { const A_GXSetTevKColorSel *q_ = p; (void)q_; w_GXSetTevKColorSel(q_->s, q_->sel); }
+void wii_GXSetTevKColorSel(uint32_t s, uint32_t sel)
+{
+   FLUSH();
+   A_GXSetTevKColorSel *q_ = q_call(R_GXSetTevKColorSel, sizeof(A_GXSetTevKColorSel));
+   (void)q_; q_->s = s; q_->sel = sel;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t sel; } A_GXSetTevKAlphaSel;
+static void R_GXSetTevKAlphaSel(const void *p) { const A_GXSetTevKAlphaSel *q_ = p; (void)q_; w_GXSetTevKAlphaSel(q_->s, q_->sel); }
+void wii_GXSetTevKAlphaSel(uint32_t s, uint32_t sel)
+{
+   FLUSH();
+   A_GXSetTevKAlphaSel *q_ = q_call(R_GXSetTevKAlphaSel, sizeof(A_GXSetTevKAlphaSel));
+   (void)q_; q_->s = s; q_->sel = sel;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t coord; uint32_t map; uint32_t chan; } A_GXSetTevOrder;
+static void R_GXSetTevOrder(const void *p) { const A_GXSetTevOrder *q_ = p; (void)q_; w_GXSetTevOrder(q_->s, q_->coord, q_->map, q_->chan); }
+void wii_GXSetTevOrder(uint32_t s, uint32_t coord, uint32_t map, uint32_t chan)
+{
+   FLUSH();
+   A_GXSetTevOrder *q_ = q_call(R_GXSetTevOrder, sizeof(A_GXSetTevOrder));
+   (void)q_; q_->s = s; q_->coord = coord; q_->map = map; q_->chan = chan;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t ras; uint32_t tex; } A_GXSetTevSwapMode;
+static void R_GXSetTevSwapMode(const void *p) { const A_GXSetTevSwapMode *q_ = p; (void)q_; w_GXSetTevSwapMode(q_->s, q_->ras, q_->tex); }
+void wii_GXSetTevSwapMode(uint32_t s, uint32_t ras, uint32_t tex)
+{
+   FLUSH();
+   A_GXSetTevSwapMode *q_ = q_call(R_GXSetTevSwapMode, sizeof(A_GXSetTevSwapMode));
+   (void)q_; q_->s = s; q_->ras = ras; q_->tex = tex;
+   Q_DONE();
+}
+typedef struct { uint32_t table; uint32_t r; uint32_t g; uint32_t b; uint32_t a; } A_GXSetTevSwapModeTable;
+static void R_GXSetTevSwapModeTable(const void *p) { const A_GXSetTevSwapModeTable *q_ = p; (void)q_; w_GXSetTevSwapModeTable(q_->table, q_->r, q_->g, q_->b, q_->a); }
+void wii_GXSetTevSwapModeTable(uint32_t table, uint32_t r, uint32_t g, uint32_t b, uint32_t a)
+{
+   FLUSH();
+   A_GXSetTevSwapModeTable *q_ = q_call(R_GXSetTevSwapModeTable, sizeof(A_GXSetTevSwapModeTable));
+   (void)q_; q_->table = table; q_->r = r; q_->g = g; q_->b = b; q_->a = a;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t ind; uint32_t fmt; uint32_t bias; uint32_t mtx; uint32_t ws; uint32_t wt; int addPrev; int utcLod; uint32_t alphaSel; } A_GXSetTevIndirect;
+static void R_GXSetTevIndirect(const void *p) { const A_GXSetTevIndirect *q_ = p; (void)q_; w_GXSetTevIndirect(q_->s, q_->ind, q_->fmt, q_->bias, q_->mtx, q_->ws, q_->wt, q_->addPrev, q_->utcLod, q_->alphaSel); }
+void wii_GXSetTevIndirect(uint32_t s, uint32_t ind, uint32_t fmt, uint32_t bias, uint32_t mtx, uint32_t ws, uint32_t wt, int addPrev, int utcLod, uint32_t alphaSel)
+{
+   FLUSH();
+   A_GXSetTevIndirect *q_ = q_call(R_GXSetTevIndirect, sizeof(A_GXSetTevIndirect));
+   (void)q_; q_->s = s; q_->ind = ind; q_->fmt = fmt; q_->bias = bias; q_->mtx = mtx; q_->ws = ws; q_->wt = wt; q_->addPrev = addPrev; q_->utcLod = utcLod; q_->alphaSel = alphaSel;
+   Q_DONE();
+}
+typedef struct { uint32_t s; } A_GXSetTevDirect;
+static void R_GXSetTevDirect(const void *p) { const A_GXSetTevDirect *q_ = p; (void)q_; w_GXSetTevDirect(q_->s); }
+void wii_GXSetTevDirect(uint32_t s)
+{
+   FLUSH();
+   A_GXSetTevDirect *q_ = q_call(R_GXSetTevDirect, sizeof(A_GXSetTevDirect));
+   (void)q_; q_->s = s;
+   Q_DONE();
+}
+typedef struct { uint8_t n; } A_GXSetNumIndStages;
+static void R_GXSetNumIndStages(const void *p) { const A_GXSetNumIndStages *q_ = p; (void)q_; w_GXSetNumIndStages(q_->n); }
+void wii_GXSetNumIndStages(uint8_t n)
+{
+   FLUSH();
+   A_GXSetNumIndStages *q_ = q_call(R_GXSetNumIndStages, sizeof(A_GXSetNumIndStages));
+   (void)q_; q_->n = n;
+   Q_DONE();
+}
+typedef struct { uint32_t s; uint32_t coord; uint32_t map; } A_GXSetIndTexOrder;
+static void R_GXSetIndTexOrder(const void *p) { const A_GXSetIndTexOrder *q_ = p; (void)q_; w_GXSetIndTexOrder(q_->s, q_->coord, q_->map); }
+void wii_GXSetIndTexOrder(uint32_t s, uint32_t coord, uint32_t map)
+{
+   FLUSH();
+   A_GXSetIndTexOrder *q_ = q_call(R_GXSetIndTexOrder, sizeof(A_GXSetIndTexOrder));
+   (void)q_; q_->s = s; q_->coord = coord; q_->map = map;
+   Q_DONE();
+}
+typedef struct { uint32_t id; float m[6]; int8_t scale; } A_GXSetIndTexMtx;
+static void R_GXSetIndTexMtx(const void *p) { const A_GXSetIndTexMtx *q_ = p; (void)q_; w_GXSetIndTexMtx(q_->id, q_->m, q_->scale); }
+void wii_GXSetIndTexMtx(uint32_t id, const float *m, int8_t scale)
+{
+   FLUSH();
+   A_GXSetIndTexMtx *q_ = q_call(R_GXSetIndTexMtx, sizeof(A_GXSetIndTexMtx));
+   (void)q_; q_->id = id; memcpy(q_->m, m, sizeof(q_->m)); q_->scale = scale;
+   Q_DONE();
+}
+typedef struct { uint32_t c0; uint8_t r0; uint32_t op; uint32_t c1; uint8_t r1; } A_GXSetAlphaCompare;
+static void R_GXSetAlphaCompare(const void *p) { const A_GXSetAlphaCompare *q_ = p; (void)q_; w_GXSetAlphaCompare(q_->c0, q_->r0, q_->op, q_->c1, q_->r1); }
+void wii_GXSetAlphaCompare(uint32_t c0, uint8_t r0, uint32_t op, uint32_t c1, uint8_t r1)
+{
+   FLUSH();
+   A_GXSetAlphaCompare *q_ = q_call(R_GXSetAlphaCompare, sizeof(A_GXSetAlphaCompare));
+   (void)q_; q_->c0 = c0; q_->r0 = r0; q_->op = op; q_->c1 = c1; q_->r1 = r1;
+   Q_DONE();
+}
+typedef struct { uint32_t type; uint32_t src; uint32_t dst; uint32_t op; } A_GXSetBlendMode;
+static void R_GXSetBlendMode(const void *p) { const A_GXSetBlendMode *q_ = p; (void)q_; w_GXSetBlendMode(q_->type, q_->src, q_->dst, q_->op); }
+void wii_GXSetBlendMode(uint32_t type, uint32_t src, uint32_t dst, uint32_t op)
+{
+   FLUSH();
+   A_GXSetBlendMode *q_ = q_call(R_GXSetBlendMode, sizeof(A_GXSetBlendMode));
+   (void)q_; q_->type = type; q_->src = src; q_->dst = dst; q_->op = op;
+   Q_DONE();
+}
+typedef struct { int on; } A_GXSetColorUpdate;
+static void R_GXSetColorUpdate(const void *p) { const A_GXSetColorUpdate *q_ = p; (void)q_; w_GXSetColorUpdate(q_->on); }
+void wii_GXSetColorUpdate(int on)
+{
+   FLUSH();
+   A_GXSetColorUpdate *q_ = q_call(R_GXSetColorUpdate, sizeof(A_GXSetColorUpdate));
+   (void)q_; q_->on = on;
+   Q_DONE();
+}
+typedef struct { int on; } A_GXSetAlphaUpdate;
+static void R_GXSetAlphaUpdate(const void *p) { const A_GXSetAlphaUpdate *q_ = p; (void)q_; w_GXSetAlphaUpdate(q_->on); }
+void wii_GXSetAlphaUpdate(int on)
+{
+   FLUSH();
+   A_GXSetAlphaUpdate *q_ = q_call(R_GXSetAlphaUpdate, sizeof(A_GXSetAlphaUpdate));
+   (void)q_; q_->on = on;
+   Q_DONE();
+}
+typedef struct { int enable; uint32_t func; int update; } A_GXSetZMode;
+static void R_GXSetZMode(const void *p) { const A_GXSetZMode *q_ = p; (void)q_; w_GXSetZMode(q_->enable, q_->func, q_->update); }
+void wii_GXSetZMode(int enable, uint32_t func, int update)
+{
+   FLUSH();
+   A_GXSetZMode *q_ = q_call(R_GXSetZMode, sizeof(A_GXSetZMode));
+   (void)q_; q_->enable = enable; q_->func = func; q_->update = update;
+   Q_DONE();
+}
+typedef struct { uint32_t mode; } A_GXSetCullMode;
+static void R_GXSetCullMode(const void *p) { const A_GXSetCullMode *q_ = p; (void)q_; w_GXSetCullMode(q_->mode); }
+void wii_GXSetCullMode(uint32_t mode)
+{
+   FLUSH();
+   sShCull = mode;
+   A_GXSetCullMode *q_ = q_call(R_GXSetCullMode, sizeof(A_GXSetCullMode));
+   (void)q_; q_->mode = mode;
+   Q_DONE();
+}
+typedef struct { TexObj o[1]; uint32_t map; } A_GXLoadTexObj;
+static void R_GXLoadTexObj(const void *p) { const A_GXLoadTexObj *q_ = p; (void)q_; w_GXLoadTexObj(q_->o, q_->map); }
+void wii_GXLoadTexObj(const TexObj *o, uint32_t map)
+{
+   FLUSH();
+   A_GXLoadTexObj *q_ = q_call(R_GXLoadTexObj, sizeof(A_GXLoadTexObj));
+   (void)q_; memcpy(q_->o, o, sizeof(q_->o)); q_->map = map;
+   Q_DONE();
+}
+typedef struct { uint8_t rgba[4]; uint32_t z; } A_GXSetCopyClear;
+static void R_GXSetCopyClear(const void *p) { const A_GXSetCopyClear *q_ = p; (void)q_; w_GXSetCopyClear(q_->rgba, q_->z); }
+void wii_GXSetCopyClear(const uint8_t *rgba, uint32_t z)
+{
+   FLUSH();
+   A_GXSetCopyClear *q_ = q_call(R_GXSetCopyClear, sizeof(A_GXSetCopyClear));
+   (void)q_; memcpy(q_->rgba, rgba, sizeof(q_->rgba)); q_->z = z;
+   Q_DONE();
+}
+typedef struct { uint16_t l; uint16_t t; uint16_t w; uint16_t h; } A_GXSetDispCopySrc;
+static void R_GXSetDispCopySrc(const void *p) { const A_GXSetDispCopySrc *q_ = p; (void)q_; w_GXSetDispCopySrc(q_->l, q_->t, q_->w, q_->h); }
+void wii_GXSetDispCopySrc(uint16_t l, uint16_t t, uint16_t w, uint16_t h)
+{
+   FLUSH();
+   A_GXSetDispCopySrc *q_ = q_call(R_GXSetDispCopySrc, sizeof(A_GXSetDispCopySrc));
+   (void)q_; q_->l = l; q_->t = t; q_->w = w; q_->h = h;
+   Q_DONE();
+}
+typedef struct { uint16_t l; uint16_t t; uint16_t w; uint16_t h; } A_GXSetTexCopySrc;
+static void R_GXSetTexCopySrc(const void *p) { const A_GXSetTexCopySrc *q_ = p; (void)q_; w_GXSetTexCopySrc(q_->l, q_->t, q_->w, q_->h); }
+void wii_GXSetTexCopySrc(uint16_t l, uint16_t t, uint16_t w, uint16_t h)
+{
+   FLUSH();
+   A_GXSetTexCopySrc *q_ = q_call(R_GXSetTexCopySrc, sizeof(A_GXSetTexCopySrc));
+   (void)q_; q_->l = l; q_->t = t; q_->w = w; q_->h = h;
+   Q_DONE();
+}
+typedef struct { uint16_t w; uint16_t h; uint32_t fmt; int mip; } A_GXSetTexCopyDst;
+static void R_GXSetTexCopyDst(const void *p) { const A_GXSetTexCopyDst *q_ = p; (void)q_; w_GXSetTexCopyDst(q_->w, q_->h, q_->fmt, q_->mip); }
+void wii_GXSetTexCopyDst(uint16_t w, uint16_t h, uint32_t fmt, int mip)
+{
+   FLUSH();
+   A_GXSetTexCopyDst *q_ = q_call(R_GXSetTexCopyDst, sizeof(A_GXSetTexCopyDst));
+   (void)q_; q_->w = w; q_->h = h; q_->fmt = fmt; q_->mip = mip;
+   Q_DONE();
+}
+typedef struct { void * dest; int clear; } A_GXCopyTex;
+static void R_GXCopyTex(const void *p) { const A_GXCopyTex *q_ = p; (void)q_; w_GXCopyTex(q_->dest, q_->clear); }
+void wii_GXCopyTex(void * dest, int clear)
+{
+   FLUSH();
+   A_GXCopyTex *q_ = q_call(R_GXCopyTex, sizeof(A_GXCopyTex));
+   (void)q_; q_->dest = dest; q_->clear = clear;
+   Q_DONE();
+}
+typedef struct { void * dest; int clear; } A_GXCopyDisp;
+static void R_GXCopyDisp(const void *p) { const A_GXCopyDisp *q_ = p; (void)q_; w_GXCopyDisp(q_->dest, q_->clear); }
+void wii_GXCopyDisp(void * dest, int clear)
+{
+   FLUSH();
+   A_GXCopyDisp *q_ = q_call(R_GXCopyDisp, sizeof(A_GXCopyDisp));
+   (void)q_; q_->dest = dest; q_->clear = clear;
+   Q_DONE();
+}
+typedef struct { const void * list; uint32_t nbytes; } A_GXCallDisplayList;
+static void R_GXCallDisplayList(const void *p) { const A_GXCallDisplayList *q_ = p; (void)q_; w_GXCallDisplayList(q_->list, q_->nbytes); }
+void wii_GXCallDisplayList(const void * list, uint32_t nbytes)
+{
+   FLUSH();
+   A_GXCallDisplayList *q_ = q_call(R_GXCallDisplayList, sizeof(A_GXCallDisplayList));
+   (void)q_; q_->list = list; q_->nbytes = nbytes;
+   Q_DONE();
+}
+
+void wii_GXSetViewportJitter(float l, float t, float w, float h, float n, float f, uint32_t field) { wii_GXSetViewport(l, t, w, h, n, f); }
+void wii_GXGetViewportv(float *v) { memcpy(v, sShVp, sizeof(sShVp)); }
+void wii_GXGetCullMode(uint32_t *mode) { *mode = sShCull; }
+void wii_GXGetProjectionv(float *p) { memcpy(p, sShProjv, sizeof(sShProjv)); }
+void wii_GXGetVtxDescv(VtxDesc *l)
+{
+   for (uint32_t a = 0; a < VA_MAX; a++) {
+      l[a].attr = a;
+      l[a].type = a == VA_NBT ? (sShNbt ? sShVcd[VA_NRM] : 0) : (a == VA_NRM && sShNbt) ? 0 : sShVcd[a];
+   }
+   l[VA_MAX].attr = VA_NULL;
+   l[VA_MAX].type = 0;
+}
+
+// Completion signals: take effect when the worker reaches them (wii_gx.c).
+void port_gx_bp_enable(void);
+void port_gx_bp_disable(void);
+void port_gx_set_drawsync(uint16_t token);
+typedef struct { uint32_t v; } A_Sig;
+static void R_BpEnable(const void *p) { port_gx_bp_enable(); }
+static void R_BpDisable(const void *p) { port_gx_bp_disable(); }
+static void R_DrawSync(const void *p) { port_gx_set_drawsync((uint16_t)((const A_Sig *)p)->v); }
+void wii_GXEnableBreakPt(void *fifoAddr) { FLUSH(); q_call(R_BpEnable, sizeof(A_Sig)); Q_DONE(); }
+void wii_GXDisableBreakPt(void) { FLUSH(); q_call(R_BpDisable, sizeof(A_Sig)); Q_DONE(); }
+void wii_GXSetDrawSync(uint16_t token) { FLUSH(); A_Sig *a = q_call(R_DrawSync, sizeof(A_Sig)); a->v = token; Q_DONE(); }

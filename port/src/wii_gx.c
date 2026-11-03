@@ -32,10 +32,10 @@ void *wii_GXSetBreakPtCallback(void *cb)
 }
 
 static volatile OSTime sBreakPtArmTime;
-void wii_GXEnableBreakPt(void *fifoAddr) { sBreakPtArmTime = OSGetSystemTime(); sBreakPtArmed = 1; }
-void wii_GXDisableBreakPt(void) { sBreakPtArmed = 0; }
+void port_gx_bp_enable(void) { sBreakPtArmTime = OSGetSystemTime(); sBreakPtArmed = 1; } // from the GX worker
+void port_gx_bp_disable(void) { sBreakPtArmed = 0; }
 
-void wii_GXSetDrawSync(uint16_t token) { sDrawSyncToken = token; }
+void port_gx_set_drawsync(uint16_t token) { sDrawSyncToken = token; }
 uint16_t wii_GXReadDrawSync(void) { return sDrawSyncToken; }
 
 // Called from the retrace alarm (interrupt context), before the game's retrace callbacks.
