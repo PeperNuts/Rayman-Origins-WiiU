@@ -327,7 +327,7 @@ static float comp(const uint8_t *p, int type, float scale)
 }
 
 // Reads attribute `a` (direct or via its array) and returns a pointer to its components.
-static const uint8_t *attr_src(int a, const uint8_t **pp)
+static __attribute__((unused)) const uint8_t *attr_src(int a, const uint8_t **pp)
 {
    const uint8_t *p = *pp;
    switch (G.vcd[a]) {
@@ -356,100 +356,18 @@ static void mtx_apply(const float *m, const float v[4], float out[3], int rows)
    for (int r = 0; r < rows; r++) out[r] = m[r * 4] * v[0] + m[r * 4 + 1] * v[1] + m[r * 4 + 2] * v[2] + m[r * 4 + 3] * v[3];
 }
 
-static __attribute__((unused)) void decode_vertex(int fmt, const uint8_t **pp, GxVertex *o)
-{
-   const uint8_t *p = *pp;
-   uint32_t pm = G.curPosMtx;
-   int tmIdx[8];
-   for (int i = 0; i < 8; i++) tmIdx[i] = -1;
-   if (G.vcd[VA_PNMTXIDX]) pm = *p++ / 3;
-   for (int i = 0; i < 8; i++)
-      if (G.vcd[VA_TEX0MTXIDX + i]) tmIdx[i] = *p++;
-
-   float pos[4] = {0, 0, 0, 1}, clr[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}}, tex[8][2] = {{0}};
-   for (int a = VA_POS; a <= 20; a++) {
-      if (G.vcd[a] == AT_NONE) continue;
-      const Vat *v = &G.vat[fmt][a];
-      const uint8_t *s = attr_src(a, &p);
-      uint32_t dsz = attr_direct_size(fmt, a);
-      if (G.vcd[a] == AT_DIRECT) p += dsz;
-      if (!s) continue;
-      float scale = 1.0f / (float)(1u << v->frac);
-      int cs = kCompSize[v->type > 4 ? 4 : v->type];
-      if (a == VA_POS) {
-         pos[0] = comp(s, v->type, scale);
-         pos[1] = comp(s + cs, v->type, scale);
-         if (v->cnt) pos[2] = comp(s + 2 * cs, v->type, scale);
-      } else if (a == VA_CLR0 || a == VA_CLR1) {
-         read_color(s, v->type, clr[a - VA_CLR0]);
-      } else if (a >= VA_TEX0) {
-         int t = a - VA_TEX0;
-         tex[t][0] = comp(s, v->type, scale);
-         if (v->cnt) tex[t][1] = comp(s + cs, v->type, scale);
-      }
-   }
-   *pp = p;
-
-   if (pm > 9) pm = 0;
-   mtx_apply(G.posMtx[pm], pos, o->pos, 3);
-   o->pos[3] = 1.0f;
-
-   // colour channels (lighting approximated as material x ambient)
-   for (int c = 0; c < 2; c++) {
-      float *out = c ? o->c1 : o->c0;
-      if ((uint32_t)c >= G.numChans) { out[0] = out[1] = out[2] = out[3] = 0; continue; }
-      const ChanCtrl *cc = &G.chan[c * 2], *ac = &G.chan[c * 2 + 1];
-      for (int k = 0; k < 4; k++) {
-         const ChanCtrl *ctl = k < 3 ? cc : ac;
-         float m = ctl->matSrc ? clr[c][k] : G.mat[c][k];
-         if (ctl->enable) m *= ctl->ambSrc ? clr[c][k] : G.amb[c][k];
-         out[k] = m;
-      }
-   }
-
-   // texture coordinate generation
-   for (uint32_t i = 0; i < GX_MAX_COORDS; i++) {
-      float *tc = o->tc[i];
-      tc[0] = tc[1] = 0; tc[2] = 1; tc[3] = 0;
-      if (i >= G.numTexGens) continue;
-      const TexGen *tg = &G.texGen[i];
-      float in[4] = {0, 0, 1, 1};
-      if (tg->src >= 4 && tg->src <= 11) { in[0] = tex[tg->src - 4][0]; in[1] = tex[tg->src - 4][1]; }
-      else if (tg->src == 0) { in[0] = pos[0]; in[1] = pos[1]; in[2] = pos[2]; }
-      else if (tg->src == 19 || tg->src == 20) { in[0] = o->c0[0]; in[1] = o->c0[1]; }
-      else continue;
-      int mtx = tmIdx[i] >= 0 ? tmIdx[i] : tg->mtx;
-      float r[3] = {in[0], in[1], 1.0f};
-      if (tg->func <= 1 && mtx >= 30 && mtx < 60) {
-         mtx_apply(G.texMtx[(mtx - 30) / 3], in, r, tg->func == 0 ? 3 : 2);
-         if (tg->func == 1) r[2] = 1.0f;
-      }
-      // Revolution GX always applies the dual (post) transform: optional normalisation, then
-      // a 3x4 post matrix (Bink scales its texel-space coordinates this way).
-      if (tg->post != 125 && tg->post >= 64 && tg->post < 124) {
-         if (tg->normalize) {
-            float l = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-            if (l > 0) { r[0] /= l; r[1] /= l; r[2] /= l; }
-         }
-         float v[4] = {r[0], r[1], r[2], 1.0f};
-         mtx_apply(G.postMtx[(tg->post - 64) / 3], v, r, 3);
-      }
-      tc[0] = r[0]; tc[1] = r[1]; tc[2] = r[2];
-   }
-}
-
 static void texgen_general(GxVertex *o, const float pos[4], float tex[8][2], const int tmIdx[8])
 {
    // texture coordinate generation
    for (uint32_t i = 0; i < GX_MAX_COORDS; i++) {
       float *tc = o->tc[i];
-      tc[0] = tc[1] = 0; tc[2] = 1; tc[3] = 0;
+      tc[0] = tc[1] = 0; tc[2] = 1;
       if (i >= G.numTexGens) continue;
       const TexGen *tg = &G.texGen[i];
       float in[4] = {0, 0, 1, 1};
       if (tg->src >= 4 && tg->src <= 11) { in[0] = tex[tg->src - 4][0]; in[1] = tex[tg->src - 4][1]; }
       else if (tg->src == 0) { in[0] = pos[0]; in[1] = pos[1]; in[2] = pos[2]; }
-      else if (tg->src == 19 || tg->src == 20) { in[0] = o->c0[0]; in[1] = o->c0[1]; }
+      else if (tg->src == 19 || tg->src == 20) { in[0] = kN255[o->c0[0]]; in[1] = kN255[o->c0[1]]; }
       else continue;
       int mtx = tmIdx[i] >= 0 ? tmIdx[i] : tg->mtx;
       float r[3] = {in[0], in[1], 1.0f};
@@ -492,7 +410,16 @@ typedef struct {
    int ncoords;              // texgens to produce (<= GX_MAX_COORDS)
    int copySrc[GX_MAX_COORDS]; // fast path: texcoord = TEXn (n) or -1 = zero
    int chans;
+   int cmode[2];             // 0 zero, 1 raw vertex RGBA8, 2 constant, 3 general (float)
+   uint8_t cconst[2][4];
 } Plan;
+
+static inline uint8_t f2u8(float v)
+{
+   if (!(v > 0.0f)) return 0;
+   if (v >= 1.0f) return 255;
+   return (uint8_t)(int)(v * 255.0f + 0.5f);
+}
 
 // 112-byte vertex copy with 8-byte moves (lfd/stfd copy bits unchanged); the library
 // memcpy is far slower and was most of the game core's time in busy scenes.
@@ -500,12 +427,9 @@ static inline void vcopy(GxVertex *restrict d, const GxVertex *restrict s)
 {
    const double *a = (const double *)s;
    double *b = (double *)d;
-   double t0 = a[0], t1 = a[1], t2 = a[2], t3 = a[3], t4 = a[4], t5 = a[5], t6 = a[6];
+   double t0 = a[0], t1 = a[1], t2 = a[2], t3 = a[3], t4 = a[4], t5 = a[5], t6 = a[6], t7 = a[7], t8 = a[8];
    __asm__ volatile("" ::: "memory");
-   b[0] = t0; b[1] = t1; b[2] = t2; b[3] = t3; b[4] = t4; b[5] = t5; b[6] = t6;
-   t0 = a[7]; t1 = a[8]; t2 = a[9]; t3 = a[10]; t4 = a[11]; t5 = a[12]; t6 = a[13];
-   __asm__ volatile("" ::: "memory");
-   b[7] = t0; b[8] = t1; b[9] = t2; b[10] = t3; b[11] = t4; b[12] = t5; b[13] = t6;
+   b[0] = t0; b[1] = t1; b[2] = t2; b[3] = t3; b[4] = t4; b[5] = t5; b[6] = t6; b[7] = t7; b[8] = t8;
 }
 
 static void plan_build(int fmt, Plan *pl)
@@ -530,6 +454,17 @@ static void plan_build(int fmt, Plan *pl)
    }
    pl->ncoords = G.numTexGens < GX_MAX_COORDS ? (int)G.numTexGens : GX_MAX_COORDS;
    pl->chans = (int)G.numChans;
+   for (int c = 0; c < 2; c++) {
+      const ChanCtrl *cc = &G.chan[c * 2], *ac = &G.chan[c * 2 + 1];
+      int attr = VA_CLR0 + c;
+      int rgba8 = G.vcd[attr] != AT_NONE && G.vat[fmt][attr].type >= 5;
+      if (c >= pl->chans) pl->cmode[c] = 0;
+      else if (cc->matSrc && ac->matSrc && !cc->enable && !ac->enable && rgba8) pl->cmode[c] = 1;
+      else if (!cc->matSrc && !ac->matSrc && !cc->enable && !ac->enable) {
+         pl->cmode[c] = 2;
+         for (int k = 0; k < 4; k++) pl->cconst[c][k] = f2u8(G.mat[c][k]);
+      } else pl->cmode[c] = 3;
+   }
    for (int i = 0; i < pl->ncoords; i++) {
       const TexGen *tg = &G.texGen[i];
       int idMtx = tg->mtx == 60 && (tg->post == 125 || tg->post < 64);
@@ -547,6 +482,7 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
    if (pl->pnmtx) pm = *p++ / 3;
    for (int i = 0; i < pl->ntm; i++) tmIdx[pl->tm[i]] = *p++;
    float pos[4] = {0, 0, 0, 1}, clr[2][4] = {{1, 1, 1, 1}, {1, 1, 1, 1}}, tex[8][2] = {{0}};
+   const uint8_t *raw[2] = {NULL, NULL};
    for (int k = 0; k < pl->nsteps; k++) {
       const Step *s = &pl->st[k];
       const uint8_t *src;
@@ -565,7 +501,8 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
          }
          break;
       case VA_CLR0: case VA_CLR1:
-         read_color(src, s->type, clr[s->attr - VA_CLR0]);
+         if (pl->cmode[s->attr - VA_CLR0] == 1) raw[s->attr - VA_CLR0] = src;
+         else read_color(src, s->type, clr[s->attr - VA_CLR0]);
          break;
       case VA_NRM:
          break;
@@ -583,16 +520,24 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
    o->pos[0] = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
    o->pos[1] = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7];
    o->pos[2] = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
-   o->pos[3] = 1.0f;
    for (int c = 0; c < 2; c++) {
-      float *out = c ? o->c1 : o->c0;
-      if (c >= pl->chans) { out[0] = out[1] = out[2] = out[3] = 0; continue; }
-      const ChanCtrl *cc = &G.chan[c * 2], *ac = &G.chan[c * 2 + 1];
-      for (int k = 0; k < 4; k++) {
-         const ChanCtrl *ctl = k < 3 ? cc : ac;
-         float v = ctl->matSrc ? clr[c][k] : G.mat[c][k];
-         if (ctl->enable) v *= ctl->ambSrc ? clr[c][k] : G.amb[c][k];
-         out[k] = v;
+      uint8_t *out = c ? o->c1 : o->c0;
+      switch (pl->cmode[c]) {
+      case 0: out[0] = out[1] = out[2] = out[3] = 0; break;
+      case 1:
+         if (raw[c]) { out[0] = raw[c][0]; out[1] = raw[c][1]; out[2] = raw[c][2]; out[3] = raw[c][3]; }
+         else out[0] = out[1] = out[2] = out[3] = 255;
+         break;
+      case 2: out[0] = pl->cconst[c][0]; out[1] = pl->cconst[c][1]; out[2] = pl->cconst[c][2]; out[3] = pl->cconst[c][3]; break;
+      default: {
+         const ChanCtrl *cc = &G.chan[c * 2], *ac = &G.chan[c * 2 + 1];
+         for (int k = 0; k < 4; k++) {
+            const ChanCtrl *ctl = k < 3 ? cc : ac;
+            float v = ctl->matSrc ? clr[c][k] : G.mat[c][k];
+            if (ctl->enable) v *= ctl->ambSrc ? clr[c][k] : G.amb[c][k];
+            out[k] = f2u8(v);
+         }
+      }
       }
    }
    if (!pl->general) {
@@ -600,7 +545,7 @@ static void decode_fast(const Plan *pl, const uint8_t **pp, GxVertex *o)
          float *tc = o->tc[i];
          if (i < pl->ncoords) { tc[0] = tex[pl->copySrc[i]][0]; tc[1] = tex[pl->copySrc[i]][1]; }
          else { tc[0] = tc[1] = 0; }
-         tc[2] = 1; tc[3] = 0;
+         tc[2] = 1;
       }
       return;
    }
@@ -707,7 +652,7 @@ static void census(int fmt, const GxVertex *v)
                    q[6][0]);
    }
    const GxTexKey *t = &sCur.tex[0];
-   WHBLogPrintf("[census]   v0 clip %.2f %.2f %.2f w %.2f | c0 %.2f %.2f %.2f %.2f c1 %.2f %.2f %.2f %.2f | tc0 %.2f %.2f %.2f | tex0 %08X %ux%u f%u | regs0 %.2f %.2f %.2f %.2f",
+   WHBLogPrintf("[census]   v0 clip %.2f %.2f %.2f w %.2f | c0 %u %u %u %u c1 %u %u %u %u | tc0 %.2f %.2f %.2f | tex0 %08X %ux%u f%u | regs0 %.2f %.2f %.2f %.2f",
                 cx, cy, cz, cw, v->c0[0], v->c0[1], v->c0[2], v->c0[3], v->c1[0], v->c1[1], v->c1[2], v->c1[3], v->tc[0][0],
                 v->tc[0][1], v->tc[0][2], (unsigned)t->image, t->width, t->height, t->fmt, sCur.regs[0][0], sCur.regs[0][1],
                 sCur.regs[0][2], sCur.regs[0][3]);
@@ -741,7 +686,7 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
    GxPacket *pk = sFill;
    uint32_t need;
    switch (prim) {
-   case 0x80: case 0x88: need = n / 4 * 6; break;
+   case 0x80: case 0x88: need = n / 4 * 4; break; // drawn as GX2 quads
    case 0x90: need = n / 3 * 3; break;
    case 0x98: case 0xA0: need = n >= 3 ? (n - 2) * 3 : 0; break;
    default: return; // lines and points: not drawn yet
@@ -753,11 +698,13 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
 
    GxCmd *last = pk->numCmds ? &pk->cmds[pk->numCmds - 1] : NULL;
    uint32_t st = pk->numStates - 1;
-   if (!last || last->type != GXCMD_DRAW || last->state != st || last->first + last->count != pk->numVerts) {
+   uint32_t mode = (prim == 0x80 || prim == 0x88) ? 19 /* GX2_PRIMITIVE_MODE_QUADS */ : 4 /* TRIANGLES */;
+   if (!last || last->type != GXCMD_DRAW || last->state != st || last->first + last->count != pk->numVerts || last->a[0] != mode) {
       last = new_cmd(GXCMD_DRAW);
       if (!last) { pk->dropped++; sStats[2]++; return; }
       last->state = st;
       last->first = pk->numVerts;
+      last->a[0] = mode;
    }
 
    // Vertices are decoded straight into the packet; only shared corners are copied.
@@ -779,7 +726,7 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
       }
       GxVertex *d;
       switch (prim) {
-      case 0x80: case 0x88: { static const uint8_t slot[4] = {0, 1, 2, 5}; d = out + slot[i & 3]; break; }
+      case 0x80: case 0x88: d = out + (i & 3); break;
       case 0x90: d = out; break;
       default: d = i < 2 ? &tmp[i] : out + 2; break;
       }
@@ -790,8 +737,8 @@ static void draw_prim(int prim, int fmt, const uint8_t *data, uint32_t n)
       }
       if (i == 0 && sCensus) census(fmt, d);
       switch (prim) {
-      case 0x80: case 0x88: // quads: 0 1 2 | 0 2 3
-         if ((i & 3) == 3) { vcopy(out + 3, out); vcopy(out + 4, out + 2); out += 6; emitted += 6; }
+      case 0x80: case 0x88: // quads, as they are
+         if ((i & 3) == 3) { out += 4; emitted += 4; }
          break;
       case 0x90:
          out++; emitted++;

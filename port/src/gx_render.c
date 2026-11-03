@@ -34,6 +34,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
 
 #include "gx.h"
 #include "port.h"
@@ -331,8 +332,16 @@ static int compile_shaders(void)
 // Fetch shaders and uniform locations: GX2 work, done on the render thread.
 static int finish_shaders(void)
 {
-   static const char *attr[7] = {"aPos", "aC0", "aC1", "aT0", "aT1", "aT2", "aT3"};
-   for (int i = 0; i < 7; i++) WHBGfxInitShaderAttribute(&sTev, attr[i], 0, i * 16, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
+   WHBGfxInitShaderAttribute(&sTev, "aPos", 0, offsetof(GxVertex, pos), GX2_ATTRIB_FORMAT_FLOAT_32_32_32);
+   WHBGfxInitShaderAttribute(&sTev, "aC0", 0, offsetof(GxVertex, c0), GX2_ATTRIB_FORMAT_UNORM_8_8_8_8);
+   WHBGfxInitShaderAttribute(&sTev, "aC1", 0, offsetof(GxVertex, c1), GX2_ATTRIB_FORMAT_UNORM_8_8_8_8);
+   static const char *tcs[4] = {"aT0", "aT1", "aT2", "aT3"};
+   for (int i = 0; i < 4; i++)
+      WHBGfxInitShaderAttribute(&sTev, tcs[i], 0, offsetof(GxVertex, tc) + i * 12, GX2_ATTRIB_FORMAT_FLOAT_32_32_32);
+   // colours are bytes in memory order R, G, B, A (no swap); "clrswap" in port.cfg flips them
+   for (uint32_t i = 0; i < sTev.numAttributes; i++)
+      if (sTev.attributes[i].format == GX2_ATTRIB_FORMAT_UNORM_8_8_8_8)
+         sTev.attributes[i].endianSwap = port_cfg("clrswap") ? GX2_ENDIAN_SWAP_8_IN_32 : GX2_ENDIAN_SWAP_NONE;
    WHBGfxInitFetchShader(&sTev);
    WHBGfxInitShaderAttribute(&sBlit, "aPos", 0, 0, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
    WHBGfxInitFetchShader(&sBlit);
@@ -1057,10 +1066,11 @@ static const char kPlainPS[] =
    "in vec4 vC0;\n"
    "out vec4 fragColor;\n"
    "void main() { fragColor = vC0; }\n";
-static GxVertex *sTestVerts;
+typedef struct { float pos[4], c0[4], c1[4]; } PlainVertex; // self-test / probe
+static PlainVertex *sTestVerts;
 static GxState sTestState;
 
-static void selftest_square(GxVertex *v, float x0, float y0, float x1, float y1, float r, float g, float b)
+static void selftest_square(PlainVertex *v, float x0, float y0, float x1, float y1, float r, float g, float b)
 {
    const float c[6][2] = {{x0, y0}, {x1, y0}, {x1, y1}, {x0, y0}, {x1, y1}, {x0, y1}};
    for (int i = 0; i < 6; i++) {
@@ -1068,7 +1078,6 @@ static void selftest_square(GxVertex *v, float x0, float y0, float x1, float y1,
       v[i].pos[0] = c[i][0]; v[i].pos[1] = c[i][1]; v[i].pos[2] = 0; v[i].pos[3] = 1;
       v[i].c0[0] = r; v[i].c0[1] = g; v[i].c0[2] = b; v[i].c0[3] = 1;
       v[i].c1[3] = 1;
-      v[i].tc[0][2] = 1;
    }
 }
 
@@ -1079,11 +1088,11 @@ static void selftest_init(void)
       WHBGfxInitShaderAttribute(&sPlain, "aC0", 0, 16, GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32);
       WHBGfxInitFetchShader(&sPlain);
    }
-   sTestVerts = MEMAllocFromDefaultHeapEx(12 * sizeof(GxVertex), 256);
+   sTestVerts = MEMAllocFromDefaultHeapEx(12 * sizeof(PlainVertex), 256);
    if (!sTestVerts) return;
    selftest_square(sTestVerts, -0.95f, 0.95f, -0.80f, 0.75f, 1, 0, 0);
    selftest_square(sTestVerts + 6, -0.75f, 0.95f, -0.60f, 0.75f, 0, 1, 0);
-   DCFlushRange(sTestVerts, 12 * sizeof(GxVertex));
+   DCFlushRange(sTestVerts, 12 * sizeof(PlainVertex));
    // TEV state: identity projection, one stage passing the rasterised colour through.
    GxState *st = &sTestState;
    memset(st, 0, sizeof(*st));
@@ -1115,8 +1124,8 @@ static void selftest_draw(void)
    GX2SetColorControl(GX2_LOGIC_OP_COPY, 0, FALSE, TRUE);
    GX2SetTargetChannelMasks(GX2_CHANNEL_MASK_RGBA, 0, 0, 0, 0, 0, 0, 0);
    GX2SetDepthOnlyControl(FALSE, FALSE, GX2_COMPARE_FUNC_ALWAYS);
-   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sTestVerts, 12 * sizeof(GxVertex));
-   GX2SetAttribBuffer(0, 12 * sizeof(GxVertex), sizeof(GxVertex), sTestVerts);
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sTestVerts, 12 * sizeof(PlainVertex));
+   GX2SetAttribBuffer(0, 12 * sizeof(PlainVertex), sizeof(PlainVertex), sTestVerts);
    if (sHavePlain) {
       GX2SetFetchShader(&sPlain.fetchShader);
       GX2SetVertexShader(sPlain.vertexShader);
@@ -1147,7 +1156,7 @@ static const char kProbePS[] =
    "out vec4 fragColor;\n"
    "void main() { fragColor = uColor + uPad[1] * 0.0; }\n";
 static int32_t sProbeOff = -1;
-static GxVertex *sProbeVerts;
+static PlainVertex *sProbeVerts;
 static uint8_t *sProbeUbo;
 
 static void probe_init(void)
@@ -1163,11 +1172,11 @@ static void probe_init(void)
    for (uint32_t i = 0; i < ps->uniformVarCount; i++)
       WHBLogPrintf("[probe]   var '%s' type %d count %u offset %u block %d", ps->uniformVars[i].name, (int)ps->uniformVars[i].type,
                    (unsigned)ps->uniformVars[i].count, (unsigned)ps->uniformVars[i].offset, (int)ps->uniformVars[i].block);
-   sProbeVerts = MEMAllocFromDefaultHeapEx(36 * sizeof(GxVertex), 256);
+   sProbeVerts = MEMAllocFromDefaultHeapEx(36 * sizeof(PlainVertex), 256);
    sProbeUbo = MEMAllocFromDefaultHeapEx(6 * 256, 256);
    if (!sProbeVerts || !sProbeUbo) return;
    for (int i = 0; i < 6; i++) selftest_square(sProbeVerts + 6 * i, -0.95f + i * 0.2f, 0.70f, -0.80f + i * 0.2f, 0.50f, 1, 1, 1);
-   DCFlushRange(sProbeVerts, 36 * sizeof(GxVertex));
+   DCFlushRange(sProbeVerts, 36 * sizeof(PlainVertex));
 }
 
 // 0 blue: buffer 15 plain | 1 yellow: buffer 15 byte-swapped | 2 magenta: register, offset/4
@@ -1179,8 +1188,8 @@ static void probe_draw(void)
    GX2SetFetchShader(&sProbe.fetchShader);
    GX2SetVertexShader(sProbe.vertexShader);
    GX2SetPixelShader(sProbe.pixelShader);
-   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sProbeVerts, 36 * sizeof(GxVertex));
-   GX2SetAttribBuffer(0, 36 * sizeof(GxVertex), sizeof(GxVertex), sProbeVerts);
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, sProbeVerts, 36 * sizeof(PlainVertex));
+   GX2SetAttribBuffer(0, 36 * sizeof(PlainVertex), sizeof(PlainVertex), sProbeVerts);
    for (int m = 0; m < 6; m++) {
       uint32_t size = (uint32_t)sProbeOff + 16;
       uint8_t *ubo = sProbeUbo + m * 256;
@@ -1229,7 +1238,7 @@ static void dump_draw(const GxPacket *pk, const GxCmd *c)
       float cz = m[8] * x->pos[0] + m[9] * x->pos[1] + m[10] * x->pos[2] + m[11];
       float cw = m[12] * x->pos[0] + m[13] * x->pos[1] + m[14] * x->pos[2] + m[15];
       WHBLogPrintf("[draw]   v%u pos %.1f %.1f %.1f -> clip %.2f %.2f %.2f w %.2f | c0 %.2f %.2f %.2f %.2f | t0 %.2f %.2f %.2f",
-                   (unsigned)i, x->pos[0], x->pos[1], x->pos[2], cx, cy, cz, cw, x->c0[0], x->c0[1], x->c0[2], x->c0[3],
+                   (unsigned)i, x->pos[0], x->pos[1], x->pos[2], cx, cy, cz, cw, x->c0[0] / 255.0f, x->c0[1] / 255.0f, x->c0[2] / 255.0f, x->c0[3] / 255.0f,
                    x->tc[0][0], x->tc[0][1], x->tc[0][2]);
    }
 }
@@ -1292,7 +1301,7 @@ static void play_game(GxPacket *pk)
          video_draw(pk, c);
          if (c->first + c->count > pk->numVerts) break;
          gx_render_step = "draw";
-         if (!sCfgNoDraw) STEP("draw", GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1));
+         if (!sCfgNoDraw) STEP("draw", GX2DrawEx(c->a[0] == 19 ? GX2_PRIMITIVE_MODE_QUADS : GX2_PRIMITIVE_MODE_TRIANGLES, c->count, c->first, 1));
          draws++;
          break;
       case GXCMD_COPYTEX:
