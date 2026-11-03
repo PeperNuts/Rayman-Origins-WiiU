@@ -118,6 +118,8 @@ void port_vi_init(void)
    OSInitThreadQueue(&sRetraceQueue);
    OSCreateAlarm(&sRetraceAlarm);
    OSSetPeriodicAlarm(&sRetraceAlarm, OSGetTime(), OSNanosecondsToTicks(16683333), retrace); // 59.94 Hz
+   extern void port_gx_bp_init(void);
+   port_gx_bp_init();
    OSCreateAlarm(&sProfAlarm);
    OSSetPeriodicAlarm(&sProfAlarm, OSGetTime(), OSNanosecondsToTicks(487000), prof_tick); // ~2 kHz, not frame-locked
 }

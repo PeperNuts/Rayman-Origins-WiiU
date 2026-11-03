@@ -8,7 +8,9 @@
 //  - draw-sync tokens (GXSetDrawSync / GXReadDrawSync).
 // The breakpoint fires from the 60 Hz retrace handler, ahead of the game's retrace
 // callbacks, like a GPU that finishes each frame within one refresh.
+#include <coreinit/alarm.h>
 #include <coreinit/interrupts.h>
+#include <coreinit/time.h>
 #include <whb/log.h>
 
 #include <stdint.h>
@@ -29,7 +31,8 @@ void *wii_GXSetBreakPtCallback(void *cb)
    return old;
 }
 
-void wii_GXEnableBreakPt(void *fifoAddr) { sBreakPtArmed = 1; }
+static volatile OSTime sBreakPtArmTime;
+void wii_GXEnableBreakPt(void *fifoAddr) { sBreakPtArmTime = OSGetSystemTime(); sBreakPtArmed = 1; }
 void wii_GXDisableBreakPt(void) { sBreakPtArmed = 0; }
 
 void wii_GXSetDrawSync(uint16_t token) { sDrawSyncToken = token; }
@@ -49,6 +52,22 @@ void port_gx_retrace(void)
 }
 
 uint32_t port_gx_breakpoints(void) { return sBreakPtFired; }
+
+// The commands before a breakpoint are already decoded when the game arms it, so a real GPU
+// would reach it within a millisecond or so: fire it then (1 kHz alarm on the game core)
+// instead of at the next retrace, which made a slightly late frame wait a whole refresh.
+static OSAlarm sBpAlarm;
+static void bp_tick(OSAlarm *a, OSContext *ctx)
+{
+   if (sBreakPtArmed && OSGetSystemTime() - sBreakPtArmTime >= (OSTime)OSMicrosecondsToTicks(500)) port_gx_retrace();
+}
+
+void port_gx_bp_init(void) // on the game core
+{
+   if (port_cfg("bpretrace")) return;
+   OSCreateAlarm(&sBpAlarm);
+   OSSetPeriodicAlarm(&sBpAlarm, OSGetTime(), OSMicrosecondsToTicks(1000), bp_tick);
+}
 
 // VISetBlack: the back end shows black while the game blanks the display.
 static volatile int sViBlack = 1;
