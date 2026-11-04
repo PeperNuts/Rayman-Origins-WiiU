@@ -272,6 +272,36 @@ static void *alloc_gpu(uint32_t size, uint32_t align)
    return p;
 }
 
+// The EFB (colour + depth) lives in MEM1, the Wii U's fast embedded memory, next to WHBGfx's
+// screen buffers: every blended pixel reads and writes it, which at twice the Wii resolution is
+// more traffic than MEM2 can carry at 60 fps. WHBGfx discards its MEM1 heap while the HOME Menu
+// is open, so the renderer allocates the EFB again afterwards (efb_alloc). "efbmem2" in
+// port.cfg (or too little MEM1) keeps it in MEM2.
+void *GfxHeapAllocMEM1(uint32_t size, uint32_t alignment);
+static int sEfbMem1 = -1;
+static int efb_alloc(void)
+{
+   GX2Surface *s = &sEfb.surface, *d = &sEfbDepth.surface;
+   if (sEfbMem1 < 0) sEfbMem1 = !port_cfg("efbmem2");
+   static int logged;
+   int where = 2;
+   s->image = d->image = NULL;
+   if (sEfbMem1) {
+      s->image = GfxHeapAllocMEM1(s->imageSize, s->alignment);
+      d->image = s->image ? GfxHeapAllocMEM1(d->imageSize, d->alignment) : NULL;
+      if (s->image && d->image) where = 1;
+      else sEfbMem1 = 0; // does not fit: MEM2 from now on (the partial block goes with the heap)
+   }
+   if (where == 2) {
+      s->image = alloc_gpu(s->imageSize, s->alignment);
+      d->image = alloc_gpu(d->imageSize, d->alignment);
+   }
+   sEfbTex.surface.image = s->image;
+   if (!logged++) WHBLogPrintf("[gfx] EFB %ux%u in MEM%d (%u KiB colour, %u KiB depth)", (unsigned)s->width,
+                               (unsigned)s->height, where, (unsigned)(s->imageSize >> 10), (unsigned)(d->imageSize >> 10));
+   return s->image && d->image;
+}
+
 static int init_targets(void)
 {
    GX2Surface *s = &sEfb.surface;
@@ -285,7 +315,6 @@ static int init_targets(void)
    sEfb.viewNumSlices = 1;
    GX2CalcSurfaceSizeAndAlignment(s);
    GX2InitColorBufferRegs(&sEfb);
-   s->image = alloc_gpu(s->imageSize, s->alignment);
 
    GX2Surface *d = &sEfbDepth.surface;
    memset(&sEfbDepth, 0, sizeof(sEfbDepth));
@@ -299,7 +328,7 @@ static int init_targets(void)
    sEfbDepth.depthClear = 1.0f;
    GX2CalcSurfaceSizeAndAlignment(d);
    GX2InitDepthBufferRegs(&sEfbDepth);
-   d->image = alloc_gpu(d->imageSize, d->alignment);
+   efb_alloc();
 
    memset(&sEfbTex, 0, sizeof(sEfbTex));
    sEfbTex.surface = *s;
@@ -474,7 +503,8 @@ static void gpu_free_frame(void)
 }
 
 // Tiled textures (much faster for the GPU to sample than linear ones): decoded into a
-// linear staging surface, then copied (and tiled) by the GPU. "lineartex" in port.cfg: linear.
+// linear staging surface, then copied (and tiled) by the GPU. Off by default ("tiledtex" in
+// port.cfg): GX2CopySurface changes GPU state in the middle of a frame (graphical errors).
 static int sLinearTex = -1;
 
 static void evict_one(void)
@@ -603,7 +633,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
    if (sNumTex >= MAX_TEX) return &sWhite;
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
-   if (sLinearTex < 0) sLinearTex = port_cfg("lineartex");
+   if (sLinearTex < 0) sLinearTex = !port_cfg("tiledtex");
    GX2Texture stage;
    int tiled = !sLinearTex && k->width >= 16 && k->height >= 16;
    if (!make_texture(&e->tex, k->width, k->height, tiled ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED,
@@ -1552,6 +1582,7 @@ static int render_main(int argc, const char **argv)
          if (port_paused || !tv->surface.image || !drc->surface.image) continue;
          GX2SetTVEnable(TRUE);
          GX2SetDRCEnable(TRUE);
+         if (sEfbMem1 > 0) efb_alloc(); // WHBGfx rebuilt its MEM1 heap
       }
       port_render_parked = 0;
       if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) { selftest_init(); spec_start(); } }
