@@ -8,6 +8,7 @@
 #include <coreinit/exception.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/systeminfo.h>
+#include <coreinit/mutex.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
 #include <whb/log.h>
@@ -16,12 +17,13 @@
 #include <whb/proc.h>
 #include <proc_ui/procui.h>
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 66"
+#define PORT_VERSION "first-boot 67"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -153,31 +155,62 @@ volatile int port_game_parked;     // set by the game thread while it waits in V
 // twice (before and after WHBGfx's own); only the first call of a pair does anything.
 // Release: the game stops at its next frame and the renderer parks (GPU idle) before the
 // buffers go. Acquire: the renderer waits until the buffers exist again (gx_render.c).
+// HOME Menu trace, also written to sd:/rayman/home_log.txt (the network log may stop while the
+// HOME Menu is open, so a freeze there would otherwise leave no trace).
+static OSMutex sSdLogLock;
+static int sSdLogReady;
+void port_home_log(const char *fmt, ...)
+{
+   char line[256];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   WHBLogPrintf("[home] %s", line);
+   if (!sSdLogReady) return;
+   OSLockMutex(&sSdLogLock);
+   FILE *f = fopen("fs:/vol/external01/rayman/home_log.txt", "a");
+   if (f) {
+      fprintf(f, "%8u ms  %s\n", (unsigned)OSTicksToMilliseconds(OSGetSystemTime()), line);
+      fclose(f);
+   }
+   OSUnlockMutex(&sSdLogLock);
+}
+static void home_log_init(void)
+{
+   OSInitMutex(&sSdLogLock);
+   FILE *f = fopen("fs:/vol/external01/rayman/home_log.txt", "w");
+   if (f) { fprintf(f, "Rayman port %s - HOME Menu trace\n", PORT_VERSION); fclose(f); }
+   sSdLogReady = 1;
+}
+
 static uint32_t home_note(void *arg)
 {
-   WHBLogPrintf("[home] %s on CPU%d (game %s)", (const char *)arg, (int)OSGetCoreId(), port_paused ? "paused" : "running");
+   port_home_log("%s on CPU%d (game %s)", (const char *)arg, (int)OSGetCoreId(), port_paused ? "paused" : "running");
    return 0;
 }
 
 static uint32_t home_release(void *arg)
 {
-   WHBLogPrintf("[home] release callback (%s) on CPU%d", arg ? "late" : "early", (int)OSGetCoreId());
+   port_home_log("release callback (%s) on CPU%d", arg ? "late" : "early", (int)OSGetCoreId());
    if (port_paused) return 0;
    port_paused = 1;
    for (int i = 0; i < 40 && !port_game_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
+   port_home_log("game %s", port_game_parked ? "stopped between frames" : "did not stop: suspending it");
    if (!port_game_parked && !sGameSuspended) { OSSuspendThread(&sGameThread); sGameSuspended = 1; }
    for (int i = 0; i < 200 && !port_render_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
-   WHBLogPrintf("[home] paused (game %s, renderer %s)", port_game_parked ? "between frames" : "suspended",
-                port_render_parked ? "parked" : "NOT parked");
+   extern volatile const char *gx_render_step;
+   port_home_log("paused (renderer %s, step %s)", port_render_parked ? "parked" : "NOT parked", (const char *)gx_render_step);
    return 0;
 }
 
 static uint32_t home_acquire(void *arg)
 {
+   port_home_log("acquire callback (%s) on CPU%d", arg ? "late" : "early", (int)OSGetCoreId());
    if (!port_paused) return 0;
    if (sGameSuspended) { OSResumeThread(&sGameThread); sGameSuspended = 0; }
    port_paused = 0;
-   WHBLogPrintf("[home] resumed");
+   port_home_log("resumed");
    return 0;
 }
 
@@ -217,6 +250,7 @@ int main(int argc, char **argv)
    }
    OSSetThreadName(&sGameThread, "Rayman game");
    OSResumeThread(&sGameThread);
+   home_log_init();
    if (port_cfg("nohome")) {
       OSEnableHomeButtonMenu(FALSE);
    } else {
@@ -227,7 +261,7 @@ int main(int argc, char **argv)
       ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_note, "release message", 255, 0);
       ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_note, "acquire message", 255, 1);
       ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 255, 2);
-      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 0, 2);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, (void *)1, 0, 2);
    }
 
    // Console drawing and progress reporting run on the watchdog (CPU0), so a busy game
@@ -235,10 +269,10 @@ int main(int argc, char **argv)
    while (WHBProcIsRunning()) {
       static int wasFg = 1;
       int fg = ProcUIInForeground();
-      if (fg != wasFg) { WHBLogPrintf("[home] main loop: %s", fg ? "foreground again" : "in background"); wasFg = fg; }
+      if (fg != wasFg) { port_home_log("main loop: %s", fg ? "foreground again" : "in background"); wasFg = fg; }
       OSSleepTicks(OSMillisecondsToTicks(100));
    }
-   WHBLogPrintf("[home] main loop ended (exit requested)");
+   port_home_log("main loop ended (exit requested)");
 
    port_screen_free();
    WHBProcShutdown();

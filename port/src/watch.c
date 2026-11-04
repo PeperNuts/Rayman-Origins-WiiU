@@ -189,6 +189,20 @@ static int watch_main(int argc, const char **argv)
          }
       }
 
+      // HOME Menu heartbeat (also on the SD card): what each part is doing while paused.
+      {
+         extern volatile int port_paused, port_render_parked, port_game_parked;
+         extern volatile const char *gx_render_step, *gx_last_api;
+         extern void port_home_log(const char *fmt, ...);
+         static int hb;
+         if (port_paused && hb < 120) {
+            hb++;
+            port_home_log("heartbeat %d: renderer %s (step %s), game %s, gx worker last %s, foreground %d", hb,
+                          port_render_parked ? "parked" : "running", (const char *)gx_render_step,
+                          port_game_parked ? "parked" : "not parked", (const char *)gx_last_api, (int)ProcUIInForeground());
+         } else if (!port_paused) hb = 0;
+      }
+
       const char *why = NULL;
       if (frozen == 5) why = "CPU1 stopped taking interrupts for 5 s (frame clock frozen)";
       if (why) {

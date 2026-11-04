@@ -523,18 +523,22 @@ static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile,
 // Compact texture formats (gx_tex.c): BC1 for CMPR, R8 / R8G8 for intensity formats.
 // "nocompact" in port.cfg: everything RGBA8 as before.
 static int sCompact = -1;
-static int make_game_texture(GX2Texture *t, const GxTexKey *k, int kind)
+static int make_game_texture(GX2Texture *t, const GxTexKey *k, int kind, GX2TileMode tile)
 {
+   int ok;
    switch (kind) {
-   case 1: return make_texture_ex(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE,
-                                  GX2_SURFACE_FORMAT_UNORM_BC1, 0x00010203);
-   case 2: return make_texture_ex(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE,
-                                  GX2_SURFACE_FORMAT_UNORM_R8, 0x00000000); // I -> R, G, B, A
-   case 3: return make_texture_ex(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE,
-                                  GX2_SURFACE_FORMAT_UNORM_R8_G8, 0x00000001); // I -> R, G, B; A -> A
+   case 1: ok = make_texture_ex(t, k->width, k->height, tile, GX2_SURFACE_USE_TEXTURE, GX2_SURFACE_FORMAT_UNORM_BC1, 0x00010203); break;
+   case 2: ok = make_texture_ex(t, k->width, k->height, tile, GX2_SURFACE_USE_TEXTURE, GX2_SURFACE_FORMAT_UNORM_R8, 0x00000000); break;
+   case 3: ok = make_texture_ex(t, k->width, k->height, tile, GX2_SURFACE_USE_TEXTURE, GX2_SURFACE_FORMAT_UNORM_R8_G8, 0x00000001); break;
+   default: ok = make_texture(t, k->width, k->height, tile, GX2_SURFACE_USE_TEXTURE); break;
    }
-   return make_texture(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE);
+   static int logged[4];
+   if (ok && kind && logged[kind]++ < 2)
+      WHBLogPrintf("[tex] kind %d %ux%u: asked tile %d, got tile %d, pitch %u, %u bytes", kind, k->width, k->height, (int)tile,
+                   (int)t->surface.tileMode, (unsigned)t->surface.pitch, (unsigned)t->surface.imageSize);
+   return ok;
 }
+static int sSurfaceCopied; // a GPU copy changed the drawing state (apply_state restores it)
 
 static void decode_game_texture(GX2Texture *t, const GxTexKey *k, int kind)
 {
@@ -718,18 +722,17 @@ static GX2Texture *get_texture(const GxTexKey *k)
    if (sNumTex >= MAX_TEX) return &sWhite;
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
-   if (sLinearTex < 0) sLinearTex = !port_cfg("tiledtex");
-   if (sCompact < 0) sCompact = !port_cfg("nocompact");
-   static int sSmall = -1;
-   if (sSmall < 0) sSmall = port_cfg("smalltex"); // R8 / R8G8: off by default (freeze at the intro)
-   int kind = sCompact ? gx_compact_kind(k->fmt) : 0;
-   if (kind > 1 && !sSmall) kind = 0;
+   if (sLinearTex < 0) sLinearTex = port_cfg("lineartex");
+   static int sBc1 = -1, sSmall = -1;
+   if (sBc1 < 0) sBc1 = port_cfg("bc1");           // BC1: off by default (wrong graphics in first-boot 65/66)
+   if (sSmall < 0) sSmall = port_cfg("smalltex");  // R8 / R8G8: off by default (freeze at the intro)
+   int kind = gx_compact_kind(k->fmt);
+   if ((kind == 1 && !sBc1) || (kind > 1 && !sSmall)) kind = 0;
    GX2Texture stage;
-   int tiled = !kind && !sLinearTex && k->width >= 16 && k->height >= 16;
-   if (kind ? !make_game_texture(&e->tex, k, kind)
-            : !make_texture(&e->tex, k->width, k->height, tiled ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED,
-                            GX2_SURFACE_USE_TEXTURE)) return &sWhite;
-   if (tiled && !make_texture(&stage, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) {
+   int tiled = kind <= 1 && !sLinearTex && k->width >= 16 && k->height >= 16;
+   if (!make_game_texture(&e->tex, k, kind, tiled ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED)) return &sWhite;
+   if (tiled && e->tex.surface.tileMode == GX2_TILE_MODE_LINEAR_ALIGNED) tiled = 0; // nothing to tile
+   if (tiled && !make_game_texture(&stage, k, kind, GX2_TILE_MODE_LINEAR_ALIGNED)) {
       MEMFreeToDefaultHeap(e->tex.surface.image);
       return &sWhite;
    }
@@ -748,6 +751,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, dec->surface.image, dec->surface.imageSize);
    if (tiled) {
       GX2CopySurface(&stage.surface, 0, 0, &e->tex.surface, 0, 0);
+      sSurfaceCopied = 1;
       GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e->tex.surface.image, e->tex.surface.imageSize);
       gpu_free_later(stage.surface.image);
    }
@@ -1136,6 +1140,13 @@ static void ubo_done(uint8_t *block, uint32_t size)
 
 static void apply_state(const GxState *st)
 {
+   // Textures first: creating one may run a GPU copy (tiling), which changes the drawing state,
+   // so the EFB, shaders and the rest are (re)applied after it.
+   uint32_t used = state_slots(st);
+   GX2Texture *tx[GX_MAX_SLOTS];
+   sSurfaceCopied = 0;
+   for (int i = 0; i < GX_MAX_SLOTS; i++) tx[i] = uSampler[i] >= 0 && (used & (1u << i)) ? get_texture(&st->tex[i]) : &sWhite;
+   if (sSurfaceCopied) bind_efb();
    const float *v = st->viewport;
    GX2SetViewport(v[0] * EFB_SCALE, v[1] * EFB_SCALE, v[2] * EFB_SCALE, v[3] * EFB_SCALE, v[4], v[5]);
    int x = clampi(st->scissor[0] * EFB_SCALE, 0, EFB_W), y = clampi(st->scissor[1] * EFB_SCALE, 0, EFB_H);
@@ -1182,12 +1193,11 @@ static void apply_state(const GxState *st)
       set_uniform(0, uMisc, 8, st->misc);
    }
 
-   // textures used by the active stages
-   uint32_t used = state_slots(st);
+   // textures used by the active stages (resolved above)
    for (int i = 0; i < GX_MAX_SLOTS; i++) {
       if (uSampler[i] < 0) continue;
       const GxTexKey *k = &st->tex[i];
-      GX2Texture *t = (used & (1u << i)) ? get_texture(k) : &sWhite;
+      GX2Texture *t = tx[i];
       static const uint8_t wrap[3] = {GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_CLAMP_MODE_WRAP, GX2_TEX_CLAMP_MODE_MIRROR};
       GX2Sampler smp;
       GX2InitSampler(&smp, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_LINEAR);
@@ -1533,7 +1543,14 @@ static void play_game(GxPacket *pk)
       case GXCMD_DRAW:
          if (!c->count) break;
          if (sCfgNoAfterFx && state_uses_rt(&pk->states[c->state])) break;
-         if (c->state != cur) { STEP("apply state", apply_state(&pk->states[c->state])); cur = c->state; }
+         if (c->state != cur) {
+            STEP("apply state", apply_state(&pk->states[c->state]));
+            cur = c->state;
+            if (sSurfaceCopied) { // the context was re-applied: vertex buffer too
+               GX2SetAttribBuffer(0, pk->numVerts * sizeof(GxVertex), sizeof(GxVertex), pk->verts);
+               sSurfaceCopied = 0;
+            }
+         }
          dump_draw(pk, c);
          video_draw(pk, c);
          if (c->first + c->count > pk->numVerts) break;
