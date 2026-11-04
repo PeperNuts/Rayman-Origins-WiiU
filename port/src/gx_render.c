@@ -1682,6 +1682,16 @@ static int render_main(int argc, const char **argv)
       if (port_paused || !ProcUIInForeground() || !tv->surface.image || !drc->surface.image) {
          if (!port_render_parked) {
             if (sHaveShaders) GX2DrawDone();
+            // Every queued frame must be on screen before WHBGfx hands the scan buffers to the
+            // system: the HOME Menu shows the last frame behind it (garbled while one was pending).
+            OSTime w0 = OSGetSystemTime();
+            for (;;) {
+               uint32_t swaps, flips;
+               OSTime lf, lv;
+               GX2GetSwapStatus(&swaps, &flips, &lf, &lv);
+               if (flips >= swaps || OSGetSystemTime() - w0 > OSMillisecondsToTicks(100)) break;
+               OSSleepTicks(OSMicrosecondsToTicks(500));
+            }
             port_render_parked = 1;
          }
          OSSleepTicks(OSMillisecondsToTicks(10));
