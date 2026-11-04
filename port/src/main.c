@@ -20,7 +20,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 56"
+#define PORT_VERSION "first-boot 57"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -70,8 +70,13 @@ static BOOL crash(OSExceptionType type, OSContext *ctx)
          n += snprintf(msg + n, sizeof(msg) - n, " %08X", (unsigned)ra);
       }
    }
-   n += snprintf(msg + n, sizeof(msg) - n, "\n");
+   OSThread *t = OSGetCurrentThread();
+   n += snprintf(msg + n, sizeof(msg) - n, "\nthread: %s\n", t && t->name ? t->name : "?");
    trace_summary(msg + n, sizeof(msg) - n, 12, 6);
+   // Into the log as well: the sender thread on CPU0 gets a moment before the fatal screen.
+   WHBLogPrintf("[crash] %s", msg);
+   OSTime t0 = OSGetSystemTime();
+   while (OSGetSystemTime() - t0 < OSMillisecondsToTicks(300)) {}
    OSFatal(msg);
    return FALSE;
 }

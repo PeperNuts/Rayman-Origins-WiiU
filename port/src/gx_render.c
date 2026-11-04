@@ -39,7 +39,7 @@
 #include "gx.h"
 #include "port.h"
 
-static int sEfbScale = 1; // 1 = Wii resolution, 2 with "efb2x" in port.cfg
+static int sEfbScale = 2; // 2 = twice the Wii resolution (default), 1 with "efb1x" in port.cfg
 #define EFB_SCALE sEfbScale
 #define SHADER_STACK (8u << 20)
 #define EFB_W (640 * EFB_SCALE)
@@ -1466,7 +1466,7 @@ static uint8_t sRenderStack[0x20000] __attribute__((aligned(16)));
 
 static int render_main(int argc, const char **argv)
 {
-   sEfbScale = port_cfg("efb2x") ? 2 : 1;
+   sEfbScale = port_cfg("efb1x") ? 1 : 2;
    WHBGfxInit();
    GX2ColorBuffer *tv = WHBGfxGetTVColourBuffer(), *drc = WHBGfxGetDRCColourBuffer();
    GX2Surface strip, pad;
