@@ -1154,9 +1154,12 @@ static void apply_state(const GxState *st)
    // Textures first: creating one may run a GPU copy (tiling), which changes the drawing state,
    // so the EFB, shaders and the rest are (re)applied after it.
    uint32_t used = state_slots(st);
-   GX2Texture *tx[GX_MAX_SLOTS];
+   GX2Texture txv[GX_MAX_SLOTS], *tx[GX_MAX_SLOTS]; // copies: a later lookup may move cache entries
    sSurfaceCopied = 0;
-   for (int i = 0; i < GX_MAX_SLOTS; i++) tx[i] = uSampler[i] >= 0 && (used & (1u << i)) ? get_texture(&st->tex[i]) : &sWhite;
+   for (int i = 0; i < GX_MAX_SLOTS; i++) {
+      txv[i] = *(uSampler[i] >= 0 && (used & (1u << i)) ? get_texture(&st->tex[i]) : &sWhite);
+      tx[i] = &txv[i];
+   }
    if (sSurfaceCopied) bind_efb();
    const float *v = st->viewport;
    GX2SetViewport(v[0] * EFB_SCALE, v[1] * EFB_SCALE, v[2] * EFB_SCALE, v[3] * EFB_SCALE, v[4], v[5]);
