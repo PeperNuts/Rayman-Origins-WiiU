@@ -27,7 +27,7 @@ for f in src/*.c src/*.S gen/stubs.S; do
     objs+=("$o")
 done
 
-"$BIN/powerpc-eabi-ld" -T rayman.ld --gc-sections --emit-relocs --no-eh-frame-hdr -z nocopyreloc \
+"$BIN/powerpc-eabi-ld" -T rayman.ld --gc-sections -u port_loc_gettext -u port_loc_template_gettext --emit-relocs --no-eh-frame-hdr -z nocopyreloc \
     -Map "$OUT/rayman.map" -o "$OUT/rayman.elf" \
     "$GCCLIB/ecrti.o" "$GCCLIB/crtbegin.o" \
     "${objs[@]}" game/game_final.o \

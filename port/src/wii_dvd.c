@@ -67,7 +67,13 @@ static void make_sd_path(char *out, size_t size, const char *discPath)
    while (*discPath == '/') discPath++;
    snprintf(out, size, "%s/%s", MODS_ROOT, discPath);
    FILE *m = fopen(out, "rb");
-   if (m) { fclose(m); WHBLogPrintf("[dvd] using mod file %s", out); return; }
+   if (m) {
+      fclose(m);
+      WHBLogPrintf("[dvd] using mod file %s", out);
+      extern volatile int port_loc_has_pad_texts;
+      if (strstr(out, "localisation.loc")) port_loc_has_pad_texts = 1;
+      return;
+   }
    snprintf(out, size, "%s/%s", DISC_ROOT, discPath);
 }
 

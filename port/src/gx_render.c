@@ -410,6 +410,8 @@ typedef struct {
    uint32_t lastUsed;
    uint32_t bytes;
    int render;      // EFB copy target
+   int iconHalf;    // Classic Controller picture half (1 colour, 2 alpha), 0 otherwise
+   int iconKind;    // controller kind the picture was decoded for
    uint32_t checked; // frame whose content hash was last compared (once per frame is enough)
    GX2Texture tex;
 } TexEntry;
@@ -490,6 +492,46 @@ static void video_note(const GxTexKey *k)
 
 static uint16_t sTexSlot[4096]; // image address -> likely sTex index (verified on use)
 
+// The game's Classic Controller picture (two 256x256 CMPR halves: colour, alpha) is swapped
+// for the GamePad or Pro Controller picture (sd:/rayman/mods/icons/gamepad.bin, pro.bin,
+// same layout) when that is the controller in use.
+#define ICON_HALF 43680
+static const uint32_t kIconHash[2] = {0x12536B97u, 0xA4C8E7A5u}; // colour, alpha (level 0)
+static uint8_t *sIconData[3]; // by controller kind (1 GamePad, 2 Pro)
+static int sIconLoaded;
+
+static uint32_t fnv_full(const uint8_t *p, uint32_t n)
+{
+   uint32_t h = 2166136261u;
+   for (uint32_t i = 0; i < n; i++) h = (h ^ p[i]) * 16777619u;
+   return h;
+}
+
+static void icons_load(void)
+{
+   if (sIconLoaded) return;
+   sIconLoaded = 1;
+   static const char *const names[3] = {NULL, "gamepad", "pro"};
+   for (int k = 1; k < 3; k++) {
+      char path[128];
+      snprintf(path, sizeof(path), "fs:/vol/external01/rayman/mods/icons/%s.bin", names[k]);
+      FILE *f = fopen(path, "rb");
+      if (!f) continue;
+      uint8_t *b = MEMAllocFromDefaultHeapEx(2 * ICON_HALF, 64);
+      if (b && fread(b, 1, 2 * ICON_HALF, f) == 2 * ICON_HALF) sIconData[k] = b;
+      fclose(f);
+      WHBLogPrintf("[tex] controller picture %s: %s", names[k], sIconData[k] ? "loaded" : "unreadable");
+   }
+}
+
+// 0, or 1/2 for the colour/alpha half of the Classic Controller picture.
+static int icon_half(const GxTexKey *k)
+{
+   if (k->fmt != 14 || k->width != 256 || k->height != 256) return 0;
+   uint32_t h = fnv_full((const uint8_t *)k->image, 32768);
+   return h == kIconHash[0] ? 1 : h == kIconHash[1] ? 2 : 0;
+}
+
 static GX2Texture *get_texture(const GxTexKey *k)
 {
    if (!k->image || !k->width || !k->height) return &sWhite;
@@ -502,6 +544,8 @@ static GX2Texture *get_texture(const GxTexKey *k)
          if (e->key.image != k->image) continue;
          if (e->render) { e->lastUsed = sFrame; sTexSlot[slot] = (uint16_t)i; return &e->tex; }
          if (e->key.width == k->width && e->key.height == k->height && e->key.fmt == k->fmt) {
+            extern volatile int port_pad_kind;
+            if (e->iconHalf && e->iconKind != port_pad_kind) e->checked = 0, e->hash ^= 1; // other controller: decode again
             if (e->checked == sFrame || e->hash == content_hash(k)) {
                e->checked = sFrame;
                e->lastUsed = sFrame;
@@ -527,7 +571,16 @@ static GX2Texture *get_texture(const GxTexKey *k)
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
    if (!make_texture(&e->tex, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) return &sWhite;
-   gx_decode_texture(k, (uint32_t *)e->tex.surface.image, e->tex.surface.pitch);
+   {
+      extern volatile int port_pad_kind;
+      icons_load();
+      int half = icon_half(k), kind = port_pad_kind;
+      GxTexKey src = *k;
+      if (half && kind > 0 && kind < 3 && sIconData[kind]) src.image = (uint32_t)(sIconData[kind] + (half - 1) * ICON_HALF);
+      gx_decode_texture(&src, (uint32_t *)e->tex.surface.image, e->tex.surface.pitch);
+      e->iconHalf = half;
+      e->iconKind = kind;
+   }
    DCFlushRange(e->tex.surface.image, e->tex.surface.imageSize);
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, e->tex.surface.image, e->tex.surface.imageSize);
    e->key = *k;

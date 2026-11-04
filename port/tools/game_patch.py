@@ -11,7 +11,14 @@ import sys
 
 nm, elf = sys.argv[1:3]
 
+# (function, offset, expected word, new word) - or a branch to a port function: new word given
+# as the name of the target symbol.
 PATCHES = [
+    # LocalisationManager::getText tail-calls Localisation_Template::getText: go through
+    # port_loc_gettext (loc_hook.c) for the controller-specific texts.
+    ('getText__Q23ITF19LocalisationManagerCFRCQ23ITF14LocalisationId', 0x0C, None, 'port_loc_gettext'),
+    # ...which calls the original at this distance from itself
+    ('port_loc_template_gettext', 0, 0xDEAD0001, ('addr', 'getText__Q23ITF21Localisation_TemplateCFRCQ23ITF14LocalisationIdQ23ITF12ITF_LANGUAGE')),
     # raki ADPCMStreamSoundNative::postCallback compares the AX voice's current address
     # (nibbles, /2) with stream buffer addresses converted to Wii physical addresses
     # (addis -0x8000). Game memory is at 0x1xxxxxxx here, where that conversion no longer
@@ -33,16 +40,23 @@ secs = []
 for i in range(shnum):
     sh = data[shoff + i * shentsize:shoff + (i + 1) * shentsize]
     name, typ, flags, addr, off, size = struct.unpack('>IIIIII', sh[:24])
-    if typ == 1 and flags & 4:
+    if typ == 1 and flags & 2:  # PROGBITS, allocated (code and data)
         secs.append((addr, off, size))
 
 for fn, delta, old, new in PATCHES:
     a = syms[fn] + delta
+    if isinstance(new, tuple):  # ('addr', symbol): the symbol's distance from port_loc_gettext
+        new = (syms[new[1]] - syms['port_loc_gettext']) & 0xFFFFFFFF
+    elif isinstance(new, str):  # b <symbol>
+        rel = syms[new] - a
+        if not -0x2000000 <= rel < 0x2000000:
+            sys.exit('game_patch: %s out of branch range' % new)
+        new = 0x48000000 | (rel & 0x03FFFFFC)
     for addr, off, size in secs:
         if addr <= a < addr + size:
             fo = off + a - addr
             cur, = struct.unpack('>I', data[fo:fo + 4])
-            if cur != old:
+            if old is not None and cur != old:
                 sys.exit('game_patch: %s+0x%X is %08X, expected %08X' % (fn, delta, cur, old))
             data[fo:fo + 4] = struct.pack('>I', new)
             break

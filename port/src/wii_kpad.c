@@ -43,6 +43,9 @@ static OSTime sPadLastUse;      // last GamePad input
 static OSTime sRemoteLastUse;   // last real remote input on channel 0
 static int sPadReported;        // the game was told channel 0 is connected (GamePad)
 volatile uint32_t port_pad_raw_hold; // raw GamePad buttons (the render thread's screen toggle)
+// Which controller the player used last, for the texts and icon the game shows for its
+// "Classic Controller" (all three reach the game as one): 0 Classic (or other), 1 GamePad, 2 Pro.
+volatile int port_pad_kind = 1;
 
 static int remote_present(int chan)
 {
@@ -131,7 +134,7 @@ static int pad_sample(KPADStatus *out)
    if (!pad_nunchuk()) {
       uint32_t ch = classic_buttons(v.hold);
       float rx = v.rightStick.x, ry = v.rightStick.y;
-      if (ch || sx * sx + sy * sy > 0.04f || rx * rx + ry * ry > 0.04f) sPadLastUse = OSGetSystemTime();
+      if (ch || sx * sx + sy * sy > 0.04f || rx * rx + ry * ry > 0.04f) { sPadLastUse = OSGetSystemTime(); port_pad_kind = 1; }
       memset(out, 0, sizeof(*out));
       out->acc.y = -1.0f;
       out->accMagnitude = 1.0f;
@@ -269,7 +272,12 @@ int32_t wii_KPADReadEx(int32_t chan, uint8_t *wiiBufs, uint32_t length, int32_t 
    if (sReads++ == 0) WHBLogPrintf("[pad] game reads chan %d: %d samples, err %d", (int)chan, (int)n, (int)e);
    for (int32_t i = 0; i < n; i++) {
       KPADStatus *s = &buf[i];
-      if (s->extensionType == WPAD_EXT_PRO_CONTROLLER) pro_to_classic(s);
+      if (s->extensionType == WPAD_EXT_PRO_CONTROLLER) {
+         pro_to_classic(s);
+         if (s->classic.hold) port_pad_kind = 2;
+      } else if (s->extensionType == WPAD_EXT_CLASSIC && s->classic.hold && !(chan == 0 && s == &buf[0] && n == 1 && sPadLastUse >= sRemoteLastUse)) {
+         port_pad_kind = 0; // a real Classic Controller
+      }
       // Wii reports Nunchuk C/Z in the core button bits.
       if (s->extensionType == WPAD_EXT_NUNCHUK || s->extensionType == WPAD_EXT_MPLUS_NUNCHUK) {
          s->hold |= s->nunchuk.hold & NUNCHUK_BUTTONS;
