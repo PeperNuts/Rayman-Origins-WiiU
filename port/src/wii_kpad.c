@@ -39,6 +39,7 @@ static uint32_t sPadPrev;       // previous synthesised hold
 static OSTime sPadLastUse;      // last GamePad input
 static OSTime sRemoteLastUse;   // last real remote input on channel 0
 static int sPadReported;        // the game was told channel 0 is connected (GamePad)
+volatile uint32_t port_pad_raw_hold; // raw GamePad buttons (the render thread's screen toggle)
 
 static int remote_present(int chan)
 {
@@ -70,6 +71,7 @@ static int pad_sample(KPADStatus *out)
    VPADStatus nv;
    if (VPADRead(VPAD_CHAN_0, &nv, 1, &e) == 1 && e == VPAD_READ_SUCCESS) { v = nv; have = 1; }
    if (!have) return 0;
+   port_pad_raw_hold = v.hold;
    uint32_t hold = pad_buttons(&v);
    float sx = v.leftStick.x, sy = v.leftStick.y;
    if (hold || sx * sx + sy * sy > 0.04f) sPadLastUse = OSGetSystemTime();
@@ -246,7 +248,22 @@ void *wii_WPADSetExtensionCallback(int32_t chan, void *cb)
 }
 
 void wii_WPADDisconnect(int32_t chan) { WPADDisconnect((WPADChan)chan); }
-void wii_WPADControlMotor(int32_t chan, uint32_t cmd) { WPADControlMotor((WPADChan)chan, cmd != 0); }
+// Rumble: the real remote, and the GamePad when it is the one in use on channel 0.
+void wii_WPADControlMotor(int32_t chan, uint32_t cmd)
+{
+   WPADControlMotor((WPADChan)chan, cmd != 0);
+   if (chan != 0) return;
+   static int on;
+   int want = cmd != 0 && sPadLastUse >= sRemoteLastUse;
+   if (want == on) return;
+   on = want;
+   if (on) {
+      static uint8_t pattern[15] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+      VPADControlMotor(VPAD_CHAN_0, pattern, 120);
+   } else {
+      VPADStopMotor(VPAD_CHAN_0);
+   }
+}
 int wii_WPADIsMotorEnabled(void) { return WPADIsMotorEnabled(); }
 uint8_t wii_WPADGetSensorBarPosition(void) { return 0; } // sensor bar below the TV
 int wii_WPADIsDpdEnabled(int32_t chan) { return (chan >= 0 && chan < NUM_CHAN) ? sDpdEnabled[chan] : 0; }

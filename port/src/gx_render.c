@@ -410,6 +410,7 @@ typedef struct {
    uint32_t lastUsed;
    uint32_t bytes;
    int render;      // EFB copy target
+   uint32_t checked; // frame whose content hash was last compared (once per frame is enough)
    GX2Texture tex;
 } TexEntry;
 
@@ -487,20 +488,33 @@ static void video_note(const GxTexKey *k)
    }
 }
 
+static uint16_t sTexSlot[4096]; // image address -> likely sTex index (verified on use)
+
 static GX2Texture *get_texture(const GxTexKey *k)
 {
    if (!k->image || !k->width || !k->height) return &sWhite;
-   for (uint32_t i = 0; i < sNumTex; i++) {
-      TexEntry *e = &sTex[i];
-      if (e->key.image != k->image) continue;
-      if (e->render) { e->lastUsed = sFrame; return &e->tex; }
-      if (e->key.width == k->width && e->key.height == k->height && e->key.fmt == k->fmt) {
-         if (e->hash == content_hash(k)) { e->lastUsed = sFrame; return &e->tex; }
-         video_note(k);
-         MEMFreeToDefaultHeap(e->tex.surface.image); // contents changed: decode again
-         sTexBytes -= e->bytes;
-         *e = sTex[--sNumTex];
-         break;
+   uint32_t slot = (k->image >> 5) & 4095, cand = sTexSlot[slot];
+   for (uint32_t pass = 0; pass < 2; pass++) {
+      uint32_t i0 = pass ? 0 : cand, i1 = pass ? sNumTex : cand + 1;
+      if (!pass && cand >= sNumTex) continue;
+      for (uint32_t i = i0; i < i1; i++) {
+         TexEntry *e = &sTex[i];
+         if (e->key.image != k->image) continue;
+         if (e->render) { e->lastUsed = sFrame; sTexSlot[slot] = (uint16_t)i; return &e->tex; }
+         if (e->key.width == k->width && e->key.height == k->height && e->key.fmt == k->fmt) {
+            if (e->checked == sFrame || e->hash == content_hash(k)) {
+               e->checked = sFrame;
+               e->lastUsed = sFrame;
+               sTexSlot[slot] = (uint16_t)i;
+               return &e->tex;
+            }
+            video_note(k);
+            MEMFreeToDefaultHeap(e->tex.surface.image); // contents changed: decode again
+            sTexBytes -= e->bytes;
+            *e = sTex[--sNumTex];
+            pass = 2;
+            break;
+         }
       }
    }
    if (gx_is_render_texture(k->image)) return &sWhite; // copy target not written yet
@@ -519,6 +533,8 @@ static GX2Texture *get_texture(const GxTexKey *k)
    e->key = *k;
    e->hash = content_hash(k);
    e->lastUsed = sFrame;
+   e->checked = sFrame;
+   sTexSlot[slot] = (uint16_t)sNumTex;
    e->bytes = e->tex.surface.imageSize;
    sTexBytes += e->bytes;
    sNumTex++;
@@ -1319,6 +1335,8 @@ static void play_game(GxPacket *pk)
 }
 
 // Scales the EFB rectangle copied by GXCopyDisp onto the TV colour buffer.
+static int sPadGame = -1; // GamePad shows the game (1) or the log (0)
+
 static void present_tv(const GxPacket *pk)
 {
    float u0 = (float)(pk->dispSrc[0] * EFB_SCALE) / EFB_W, v0 = (float)(pk->dispSrc[1] * EFB_SCALE) / EFB_H;
@@ -1446,7 +1464,9 @@ static int render_main(int argc, const char **argv)
       static OSTime lastPad;
       static uint32_t lastLines = 0xFFFFFFFF;
       uint32_t lines = port_log_count();
-      if (lines != lastLines && OSGetSystemTime() - lastPad > OSMillisecondsToTicks(200)) {
+      if (sPadGame < 0) sPadGame = !port_cfg("padlog");
+      int padLog = !sPadGame || !sHaveShaders || pk->black; // the log until the game shows a picture
+      if (padLog && lines != lastLines && OSGetSystemTime() - lastPad > OSMillisecondsToTicks(200)) {
          lastPad = OSGetSystemTime();
          lastLines = lines;
          port_fill(&pad, 0x000000FF);
@@ -1477,9 +1497,16 @@ static int render_main(int argc, const char **argv)
       else WHBGfxClearColor((cc >> 24) / 255.0f, ((cc >> 16) & 255) / 255.0f, ((cc >> 8) & 255) / 255.0f, 1.0f);
       port_blit(&strip, &tv->surface, 0, (int)tv->surface.height - (int)strip.height);
       WHBGfxFinishRenderTV();
+      // GamePad: the game (default) or the log; L stick + R stick clicked together switches.
+      static uint32_t padPrev;
+      extern volatile uint32_t port_pad_raw_hold;
+      uint32_t ph = port_pad_raw_hold, both = 0x00060000; // VPAD_BUTTON_STICK_L | VPAD_BUTTON_STICK_R
+      if ((ph & both) == both && (padPrev & both) != both) { sPadGame = !sPadGame; lastLines = 0xFFFFFFFF; }
+      padPrev = ph;
       WHBGfxBeginRenderDRC();
       WHBGfxClearColor(0, 0, 0, 1);
-      port_blit(&pad, &drc->surface, 0, 0);
+      if (!padLog) present_tv(pk);
+      else port_blit(&pad, &drc->surface, 0, 0);
       WHBGfxFinishRenderDRC();
       gx_render_step = "finish";
       OSTime tf0 = OSGetSystemTime();

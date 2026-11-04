@@ -37,6 +37,7 @@ done
 
 # GX FIFO stores -> stream trampolines (gx_core.c parses the stream)
 python3 -I tools/wgp_patch.py "$BIN/powerpc-eabi-objdump" "$BIN/powerpc-eabi-nm" "$OUT/rayman.elf"
+python3 -I tools/game_patch.py "$BIN/powerpc-eabi-nm" "$OUT/rayman.elf"
 
 # Small-data instructions were resolved by ld against anchors that move together with the
 # data, so the loader must not touch them: turn their relocations into R_PPC_NONE.
