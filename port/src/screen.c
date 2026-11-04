@@ -196,8 +196,9 @@ void port_log_flush_now(void)
 
 void port_log_udp_start(void)
 {
+   // Any core: when one core is stuck (a crash report busy-waits), the log still goes out.
    OSCreateThread(&sUdp, (OSThreadEntryPointFn)udp_main, 0, NULL, sUdpStack + sizeof(sUdpStack), sizeof(sUdpStack), 1,
-                  OS_THREAD_ATTRIB_AFFINITY_CPU0);
+                  OS_THREAD_ATTRIB_AFFINITY_ANY);
    OSSetThreadName(&sUdp, "Rayman log sender");
    OSResumeThread(&sUdp);
 }

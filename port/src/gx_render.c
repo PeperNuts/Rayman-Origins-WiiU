@@ -720,7 +720,10 @@ static GX2Texture *get_texture(const GxTexKey *k)
    memset(e, 0, sizeof(*e));
    if (sLinearTex < 0) sLinearTex = !port_cfg("tiledtex");
    if (sCompact < 0) sCompact = !port_cfg("nocompact");
+   static int sSmall = -1;
+   if (sSmall < 0) sSmall = port_cfg("smalltex"); // R8 / R8G8: off by default (freeze at the intro)
    int kind = sCompact ? gx_compact_kind(k->fmt) : 0;
+   if (kind > 1 && !sSmall) kind = 0;
    GX2Texture stage;
    int tiled = !kind && !sLinearTex && k->width >= 16 && k->height >= 16;
    if (kind ? !make_game_texture(&e->tex, k, kind)
