@@ -452,13 +452,38 @@ static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile,
    return s->image != NULL;
 }
 
+// GPU memory still referenced by a frame in flight is freed once that frame is done:
+// gpu_free_later() collects it for the frame being built, gpu_free_frame() runs after the
+// renderer waited for that frame's timestamp (two lists: built / in flight).
+#define FREE_MAX 1024
+static void *sFreeList[2][FREE_MAX];
+static uint32_t sFreeCount[2], sFreeCur;
+static void gpu_free_later(void *p)
+{
+   if (!p) return;
+   if (sFreeCount[sFreeCur] >= FREE_MAX) { GX2DrawDone(); MEMFreeToDefaultHeap(p); return; }
+   sFreeList[sFreeCur][sFreeCount[sFreeCur]++] = p;
+}
+// Called once per frame after the previous frame finished on the GPU.
+static void gpu_free_frame(void)
+{
+   uint32_t done = sFreeCur ^ 1; // the list of the frame that just finished
+   for (uint32_t i = 0; i < sFreeCount[done]; i++) MEMFreeToDefaultHeap(sFreeList[done][i]);
+   sFreeCount[done] = 0;
+   sFreeCur = done; // the next frame collects here
+}
+
+// Tiled textures (much faster for the GPU to sample than linear ones): decoded into a
+// linear staging surface, then copied (and tiled) by the GPU. "lineartex" in port.cfg: linear.
+static int sLinearTex = -1;
+
 static void evict_one(void)
 {
    uint32_t best = 0xFFFFFFFF, bi = 0;
    for (uint32_t i = 0; i < sNumTex; i++)
       if (!sTex[i].render && sTex[i].lastUsed < best && sTex[i].lastUsed + 2 < sFrame) { best = sTex[i].lastUsed; bi = i; }
    if (best == 0xFFFFFFFF) return;
-   MEMFreeToDefaultHeap(sTex[bi].tex.surface.image);
+   gpu_free_later(sTex[bi].tex.surface.image);
    sTexBytes -= sTex[bi].bytes;
    sTex[bi] = sTex[--sNumTex];
    sTexStats[1]++;
@@ -561,7 +586,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
                return &e->tex;
             }
             video_note(k);
-            MEMFreeToDefaultHeap(e->tex.surface.image); // contents changed: decode again
+            gpu_free_later(e->tex.surface.image); // contents changed: decode again
             sTexBytes -= e->bytes;
             *e = sTex[--sNumTex];
             pass = 2;
@@ -578,19 +603,33 @@ static GX2Texture *get_texture(const GxTexKey *k)
    if (sNumTex >= MAX_TEX) return &sWhite;
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
-   if (!make_texture(&e->tex, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) return &sWhite;
+   if (sLinearTex < 0) sLinearTex = port_cfg("lineartex");
+   GX2Texture stage;
+   int tiled = !sLinearTex && k->width >= 16 && k->height >= 16;
+   if (!make_texture(&e->tex, k->width, k->height, tiled ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED,
+                     GX2_SURFACE_USE_TEXTURE)) return &sWhite;
+   if (tiled && !make_texture(&stage, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) {
+      MEMFreeToDefaultHeap(e->tex.surface.image);
+      return &sWhite;
+   }
+   GX2Texture *dec = tiled ? &stage : &e->tex;
    {
       extern volatile int port_pad_kind;
       icons_load();
       int half = icon_half(k), kind = port_pad_kind;
       GxTexKey src = *k;
       if (half && kind > 0 && kind < 3 && sIconData[kind]) src.image = (uint32_t)(sIconData[kind] + (half - 1) * ICON_HALF);
-      gx_decode_texture(&src, (uint32_t *)e->tex.surface.image, e->tex.surface.pitch);
+      gx_decode_texture(&src, (uint32_t *)dec->surface.image, dec->surface.pitch);
       e->iconHalf = half;
       e->iconKind = kind;
    }
-   DCFlushRange(e->tex.surface.image, e->tex.surface.imageSize);
-   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, e->tex.surface.image, e->tex.surface.imageSize);
+   DCFlushRange(dec->surface.image, dec->surface.imageSize);
+   GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, dec->surface.image, dec->surface.imageSize);
+   if (tiled) {
+      GX2CopySurface(&stage.surface, 0, 0, &e->tex.surface, 0, 0);
+      GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e->tex.surface.image, e->tex.surface.imageSize);
+      gpu_free_later(stage.surface.image);
+   }
    e->key = *k;
    e->hash = content_hash(k);
    e->lastUsed = sFrame;
@@ -1060,7 +1099,7 @@ static GX2Texture *render_texture(uint32_t dest, uint32_t w, uint32_t h)
 {
    TexEntry *e = find_tex(dest);
    if (e && e->render && e->tex.surface.width == w && e->tex.surface.height == h) return &e->tex;
-   if (e) { MEMFreeToDefaultHeap(e->tex.surface.image); sTexBytes -= e->bytes; *e = sTex[--sNumTex]; }
+   if (e) { gpu_free_later(e->tex.surface.image); sTexBytes -= e->bytes; *e = sTex[--sNumTex]; }
    if (sNumTex >= MAX_TEX) return NULL;
    e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
@@ -1606,6 +1645,7 @@ static int render_main(int argc, const char **argv)
       if (noPipe) GX2DrawDone();
       else if (prevTs) GX2WaitTimeStamp(prevTs);
       prevTs = ts;
+      gpu_free_frame(); // memory the previous frame used
       if (prevPk) gx_release_packet(prevPk);
       prevPk = pk != &idle ? pk : NULL;
       // at most two flips queued (keeps pacing at the TV rate without serialising CPU and GPU)
