@@ -39,11 +39,14 @@
 #include "gx.h"
 #include "port.h"
 
-static int sEfbScale = 2; // 2 = twice the Wii resolution (default), 1 with "efb1x" in port.cfg
+// EFB resolution: 1.5x the Wii's by default (960x792); "efb1x" (Wii) or "efb2x" (1280x1056) in
+// port.cfg. 2x was GPU-bound in busy levels (many large see-through layers).
+static float sEfbScale = 1.5f;
 #define EFB_SCALE sEfbScale
 #define SHADER_STACK (8u << 20)
-#define EFB_W (640 * EFB_SCALE)
-#define EFB_H (528 * EFB_SCALE)
+#define SC(v) ((int)((v) * EFB_SCALE + 0.5f)) // Wii pixels -> EFB pixels
+#define EFB_W SC(640)
+#define EFB_H SC(528)
 
 // Switches read from sd:/rayman/port.cfg (to bisect GPU problems without new builds)
 static int sCfgNoEfb, sCfgNoClear, sCfgNoCopy, sCfgNoDraw, sCfgNoAfterFx;
@@ -736,7 +739,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
    if (sLinearTex < 0) sLinearTex = !port_cfg("tiledtex"); // tiled: opt-in until the graphics are right
    static int sBc1 = -1, sSmall = -1;
    if (sBc1 < 0) sBc1 = port_cfg("bc1");           // BC1: off by default (wrong graphics in first-boot 65/66)
-   if (sSmall < 0) sSmall = port_cfg("smalltex");  // R8 / R8G8: off by default (freeze at the intro)
+   if (sSmall < 0) sSmall = !port_cfg("nosmalltex"); // R8 / R8G8 (the intro freeze was the 'kind' bug)
    int kind = gx_compact_kind(k->fmt);
    if ((kind == 1 && !sBc1) || (kind > 1 && !sSmall)) kind = 0;
    GX2Texture stage;
@@ -1163,8 +1166,8 @@ static void apply_state(const GxState *st)
    if (sSurfaceCopied) bind_efb();
    const float *v = st->viewport;
    GX2SetViewport(v[0] * EFB_SCALE, v[1] * EFB_SCALE, v[2] * EFB_SCALE, v[3] * EFB_SCALE, v[4], v[5]);
-   int x = clampi(st->scissor[0] * EFB_SCALE, 0, EFB_W), y = clampi(st->scissor[1] * EFB_SCALE, 0, EFB_H);
-   int w = clampi(st->scissor[2] * EFB_SCALE, 0, EFB_W - x), h = clampi(st->scissor[3] * EFB_SCALE, 0, EFB_H - y);
+   int x = clampi(SC(st->scissor[0]), 0, EFB_W), y = clampi(SC(st->scissor[1]), 0, EFB_H);
+   int w = clampi(SC(st->scissor[0] + st->scissor[2]) - x, 0, EFB_W - x), h = clampi(SC(st->scissor[1] + st->scissor[3]) - y, 0, EFB_H - y);
    GX2SetScissor(x, y, w ? w : 1, h ? h : 1);
 
    if (sBlockMode) {
@@ -1292,15 +1295,15 @@ static void copy_tex(const GxCmd *c)
                       (unsigned)c->a[7], (unsigned)c->a[4], (unsigned)c->a[5]);
       }
    }
-   if (l >= EFB_W / EFB_SCALE || t >= EFB_H / EFB_SCALE) w = h = 0;
-   if (l + w > EFB_W / EFB_SCALE) w = EFB_W / EFB_SCALE - l;
-   if (t + h > EFB_H / EFB_SCALE) h = EFB_H / EFB_SCALE - t;
+   if (l >= 640 || t >= 528) w = h = 0;
+   if (l + w > 640) w = 640 - l;
+   if (t + h > 528) h = 528 - t;
    if (sCfgNoCopy || !w || !h) { if (c->a[4]) clear_efb(c->a[5], c->a[6]); return; }
    gx_render_step = "copytex";
-   GX2Texture *dst = render_texture(c->a[2], w * EFB_SCALE, h * EFB_SCALE);
+   GX2Texture *dst = render_texture(c->a[2], SC(l + w) - SC(l), SC(t + h) - SC(t));
    if (dst) {
       GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, sEfb.surface.image, sEfb.surface.imageSize);
-      GX2Rect r = {(int32_t)(l * EFB_SCALE), (int32_t)(t * EFB_SCALE), (int32_t)((l + w) * EFB_SCALE), (int32_t)((t + h) * EFB_SCALE)};
+      GX2Rect r = {(int32_t)SC(l), (int32_t)SC(t), (int32_t)SC(l + w), (int32_t)SC(t + h)};
       GX2Point pt = {0, 0};
       STEP("copy EFB to texture", GX2CopySurfaceEx(&sEfb.surface, 0, 0, &dst->surface, 0, 0, 1, &r, &pt));
       GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, dst->surface.image, dst->surface.imageSize);
@@ -1657,7 +1660,7 @@ static uint8_t sRenderStack[0x20000] __attribute__((aligned(16)));
 
 static int render_main(int argc, const char **argv)
 {
-   sEfbScale = port_cfg("efb1x") ? 1 : 2;
+   sEfbScale = port_cfg("efb1x") ? 1.0f : port_cfg("efb2x") ? 2.0f : 1.5f;
    WHBGfxInit();
    GX2ColorBuffer *tv = WHBGfxGetTVColourBuffer(), *drc = WHBGfxGetDRCColourBuffer();
    GX2Surface strip, pad;
