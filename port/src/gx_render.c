@@ -480,7 +480,9 @@ static uint32_t content_hash(const GxTexKey *k)
    const uint32_t *p = (const uint32_t *)k->image;
    uint32_t n = size / 4, h = 2166136261u;
    if (!n) return 0;
-   int d = dyn_find(k->image);
+   static int oldHash = -1;
+   if (oldHash < 0) oldHash = port_cfg("oldhash"); // only the 16 samples, as before first-boot 65
+   int d = oldHash ? -1 : dyn_find(k->image);
    if (d >= 0 && sDynCount[d] >= 2) {
       uint32_t a = h, b = 0x9E3779B9u;
       uint32_t i = 0;
@@ -722,7 +724,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
    if (sNumTex >= MAX_TEX) return &sWhite;
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
-   if (sLinearTex < 0) sLinearTex = port_cfg("lineartex");
+   if (sLinearTex < 0) sLinearTex = !port_cfg("tiledtex"); // tiled: opt-in until the graphics are right
    static int sBc1 = -1, sSmall = -1;
    if (sBc1 < 0) sBc1 = port_cfg("bc1");           // BC1: off by default (wrong graphics in first-boot 65/66)
    if (sSmall < 0) sSmall = port_cfg("smalltex");  // R8 / R8G8: off by default (freeze at the intro)
@@ -1790,7 +1792,17 @@ static int render_main(int argc, const char **argv)
       // at most two flips queued (keeps pacing at the TV rate without serialising CPU and GPU)
       // Polled with a time limit: no flips happen while the HOME Menu takes the screens, and
       // a blocking GX2WaitForFlip would keep the renderer from parking.
-      {
+      static int flipWait = -1;
+      if (flipWait < 0) flipWait = port_cfg("flipwait"); // the blocking wait of first-boot 64
+      if (flipWait) {
+         for (int guard = 0; guard < 4; guard++) {
+            uint32_t swaps, flips;
+            OSTime lf, lv;
+            GX2GetSwapStatus(&swaps, &flips, &lf, &lv);
+            if (swaps - flips <= 1) break;
+            GX2WaitForFlip();
+         }
+      } else {
          OSTime w0 = OSGetSystemTime();
          for (;;) {
             uint32_t swaps, flips;

@@ -23,7 +23,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 67"
+#define PORT_VERSION "first-boot 68"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -195,9 +195,9 @@ static uint32_t home_release(void *arg)
    port_home_log("release callback (%s) on CPU%d", arg ? "late" : "early", (int)OSGetCoreId());
    if (port_paused) return 0;
    port_paused = 1;
-   for (int i = 0; i < 40 && !port_game_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
-   port_home_log("game %s", port_game_parked ? "stopped between frames" : "did not stop: suspending it");
-   if (!port_game_parked && !sGameSuspended) { OSSuspendThread(&sGameThread); sGameSuspended = 1; }
+   // The game thread is never suspended: it may hold locks (file system, heap) that everything
+   // else needs, which froze the console. It keeps running in the background and stops by
+   // itself at its next frame (VIWaitForRetrace); only the GPU and the sound have to be idle.
    for (int i = 0; i < 200 && !port_render_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
    extern volatile const char *gx_render_step;
    port_home_log("paused (renderer %s, step %s)", port_render_parked ? "parked" : "NOT parked", (const char *)gx_render_step);
