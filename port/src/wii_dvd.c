@@ -58,9 +58,16 @@ static char *sEntryPath[MAX_ENTRIES];
 static uint32_t sEntrySize[MAX_ENTRIES];
 static int32_t sEntryCount;
 
+#define MODS_ROOT "fs:/vol/external01/rayman/mods"
+static char *sEntryReal[MAX_ENTRIES]; // resolved SD path (a mod file replaces the disc file)
+
+// sd:/rayman/mods/<path> replaces disc file <path> when it exists (e.g. edited text).
 static void make_sd_path(char *out, size_t size, const char *discPath)
 {
    while (*discPath == '/') discPath++;
+   snprintf(out, size, "%s/%s", MODS_ROOT, discPath);
+   FILE *m = fopen(out, "rb");
+   if (m) { fclose(m); WHBLogPrintf("[dvd] using mod file %s", out); return; }
    snprintf(out, size, "%s/%s", DISC_ROOT, discPath);
 }
 
@@ -82,6 +89,7 @@ int32_t wii_DVDConvertPathToEntrynum(const char *path)
    if (sEntryCount >= MAX_ENTRIES) return -1;
    int32_t e = sEntryCount++;
    sEntryPath[e] = strdup(path);
+   sEntryReal[e] = strdup(sd);
    sEntrySize[e] = (uint32_t)size;
    WHBLogPrintf("[dvd] #%d %s (%u bytes)", (int)e, path, (unsigned)size);
    return e;
@@ -104,9 +112,7 @@ static FILE *file_of(WiiDVDFileInfo *fi)
 int wii_DVDFastOpen(int32_t entry, WiiDVDFileInfo *fi)
 {
    if (entry < 0 || entry >= sEntryCount) return 0;
-   char sd[512];
-   make_sd_path(sd, sizeof(sd), sEntryPath[entry]);
-   FILE *f = fopen(sd, "rb");
+   FILE *f = fopen(sEntryReal[entry], "rb");
    if (!f) return 0;
    int slot = -1;
    for (int i = 0; i < MAX_OPEN; i++) {
