@@ -135,10 +135,14 @@ void port_blit(GX2Surface *src, GX2Surface *dst, int x, int y)
 static OSThread sUdp __attribute__((aligned(16)));
 static uint8_t sUdpStack[0x8000] __attribute__((aligned(16)));
 
+static int sSock = -1;
+static volatile uint32_t sSent;
+
 static int udp_main(int argc, const char **argv)
 {
    socket_lib_init();
    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+   sSock = sock;
    int on = 1;
    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
    struct sockaddr_in a;
@@ -146,10 +150,10 @@ static int udp_main(int argc, const char **argv)
    a.sin_family = AF_INET;
    a.sin_port = 4405;                // big-endian CPU: already network order
    a.sin_addr.s_addr = INADDR_BROADCAST;
-   uint32_t sent = 0;
    static char line[COLS + 2];
    for (;;) {
       OSSleepTicks(OSMillisecondsToTicks(5));
+      uint32_t sent = sSent;
       for (;;) {
          if (!OSUninterruptibleSpinLock_TryAcquireWithTimeout(&sLock, OSMillisecondsToTicks(2))) break;
          uint32_t total = sCount;
@@ -159,12 +163,35 @@ static int udp_main(int argc, const char **argv)
          OSUninterruptibleSpinLock_Release(&sLock);
          if (!have) break;
          sent++;
+         sSent = sent;
          size_t n = strlen(line);
          line[n++] = '\n';
          sendto(sock, line, n, 0, (struct sockaddr *)&a, sizeof(a));
       }
    }
    return 0;
+}
+
+// From the crash handler: send whatever the sender thread has not sent yet, from this
+// thread (the sender may share the crashed core and never run again).
+void port_log_flush_now(void)
+{
+   if (sSock < 0) return;
+   struct sockaddr_in a;
+   memset(&a, 0, sizeof(a));
+   a.sin_family = AF_INET;
+   a.sin_port = 4405;
+   a.sin_addr.s_addr = INADDR_BROADCAST;
+   static char line[COLS + 2];
+   uint32_t sent = sSent, total = sCount;
+   if (total - sent > LINES) sent = total - LINES;
+   for (; sent < total; sent++) {
+      strcpy(line, sLines[sent % LINES]);
+      size_t n = strlen(line);
+      line[n++] = '\n';
+      sendto(sSock, line, n, 0, (struct sockaddr *)&a, sizeof(a));
+   }
+   sSent = sent;
 }
 
 void port_log_udp_start(void)

@@ -1125,7 +1125,7 @@ static void copy_tex(const GxCmd *c)
 }
 
 static uint32_t sDraws, sLastDraws, sLastVerts, sLastStates, sShown;
-static OSTime sTimePlay, sTimeFinish;
+static OSTime sTimePlay, sTimeFinish, sTimeWait;
 
 // ---------------------------------------------------------------------------------------
 // Self-test squares drawn into the EFB's top-left corner every frame:
@@ -1509,6 +1509,7 @@ static int render_main(int argc, const char **argv)
       port_render_parked = 0;
       if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) { selftest_init(); spec_start(); } }
       static GxPacket idle = {.black = 1};
+      OSTime tw0 = OSGetSystemTime();
       GxPacket *pk = gx_acquire_packet();
       static OSTime lastShown;
       if (!pk) {
@@ -1521,6 +1522,7 @@ static int render_main(int argc, const char **argv)
          pk = &idle;
       }
       lastShown = OSGetSystemTime();
+      sTimeWait += lastShown - tw0;
       sFrame++;
 
       OSTime tp0 = OSGetSystemTime();
@@ -1556,7 +1558,12 @@ static int render_main(int argc, const char **argv)
       }
 
       gx_render_step = "present";
-      WHBGfxBeginRender();
+      // WHBGfxBeginRender waits until every swap has flipped, which runs the CPU and GPU one
+      // after the other (30 fps once both together take more than one TV frame). One flip may
+      // stay queued instead (the wait at the end of the frame), so they work side by side.
+      static int whbWait = -1;
+      if (whbWait < 0) whbWait = port_cfg("whbwait");
+      if (whbWait) WHBGfxBeginRender();
       WHBGfxBeginRenderTV();
       uint32_t cc = pk->clearColor;
       if (pk->black) WHBGfxClearColor(0, 0, 0, 1);
@@ -1613,11 +1620,12 @@ static int render_main(int argc, const char **argv)
       if (secs >= lastReport + 5) {
          uint32_t span = secs - lastReport;
          lastReport = secs;
-         if (sShown) WHBLogPrintf("[perf] %.1f fps shown | per frame: play %.1f ms (CPU), finish %.1f ms (GPU+vsync) | spec shaders %u ready, %u failed, %u draws",
+         if (sShown) WHBLogPrintf("[perf] %.1f fps shown | per frame: play %.1f ms (CPU), finish %.1f ms (GPU+vsync), waiting for the game %.1f ms | spec shaders %u ready, %u failed, %u draws",
                                   sShown / (float)(span ? span : 1), OSTicksToMicroseconds(sTimePlay) / 1000.0f / sShown,
-                                  OSTicksToMicroseconds(sTimeFinish) / 1000.0f / sShown, (unsigned)sSpecStats[0],
+                                  OSTicksToMicroseconds(sTimeFinish) / 1000.0f / sShown,
+                                  OSTicksToMicroseconds(sTimeWait) / 1000.0f / sShown, (unsigned)sSpecStats[0],
                                   (unsigned)sSpecStats[1], (unsigned)sSpecStats[2]);
-         sShown = 0; sTimePlay = sTimeFinish = 0; sSpecStats[2] = 0;
+         sShown = 0; sTimePlay = sTimeFinish = sTimeWait = 0; sSpecStats[2] = 0;
          WHBLogPrintf("[gfx] frame %u: %u draws, %u verts, %u states, %u dropped | tex %u cached (%u MB), %u decoded, %u evicted, %u rt | gx prims %u dl %u copies %u unk %u pkt drop %u",
                       (unsigned)pk->frame, (unsigned)sLastDraws, (unsigned)sLastVerts, (unsigned)sLastStates,
                       (unsigned)pk->dropped, (unsigned)sNumTex, (unsigned)(sTexBytes >> 20), (unsigned)sTexStats[0],

@@ -3,6 +3,7 @@
 // Runs the original Wii game code on top of the replacement layer and reports how far it
 // gets: live log on the TV/GamePad (and UDP port 4405), and an OSFatal screen with the
 // crash location if game code faults.
+#include <coreinit/core.h>
 #include <coreinit/debug.h>
 #include <coreinit/exception.h>
 #include <coreinit/memdefaultheap.h>
@@ -20,7 +21,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 59"
+#define PORT_VERSION "first-boot 60"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -71,10 +72,14 @@ static BOOL crash(OSExceptionType type, OSContext *ctx)
       }
    }
    OSThread *t = OSGetCurrentThread();
-   n += snprintf(msg + n, sizeof(msg) - n, "\nthread: %s\n", t && t->name ? t->name : "?");
+   n += snprintf(msg + n, sizeof(msg) - n, "\nthread: %s (CPU%d)\n", t && t->name ? t->name : "?", (int)OSGetCoreId());
+   extern volatile const char *gx_last_api, *gx_render_step;
+   n += snprintf(msg + n, sizeof(msg) - n, "gx worker: %s  renderer: %s\n", (const char *)gx_last_api, (const char *)gx_render_step);
    trace_summary(msg + n, sizeof(msg) - n, 12, 6);
    // Into the log as well: the sender thread on CPU0 gets a moment before the fatal screen.
    WHBLogPrintf("[crash] %s", msg);
+   extern void port_log_flush_now(void);
+   if (OSGetCoreId() == 0) port_log_flush_now(); // the sender thread lives on CPU0
    OSTime t0 = OSGetSystemTime();
    while (OSGetSystemTime() - t0 < OSMillisecondsToTicks(300)) {}
    OSFatal(msg);
