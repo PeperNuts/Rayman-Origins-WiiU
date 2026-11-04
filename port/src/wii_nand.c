@@ -85,7 +85,9 @@ int32_t wii_NANDGetHomeDir(char *path)
    strcpy(path, HOME_DIR);
    return NAND_OK;
 }
-int32_t wii_NANDSetUserData(void *a, void *b) { return NAND_OK; }
+// The game's NANDSetUserData is shared (identical-code folding) with a tiny constructor used
+// some 900 times ("stw r4,0(r3); blr"): it must store the word and hand back its first argument.
+void *wii_NANDSetUserData(void *a, void *b) { *(void **)a = b; return a; }
 int32_t wii_NANDCheck(uint32_t blocks, uint32_t inodes, uint32_t *answer)
 {
    NLOG("check %u blocks %u inodes", (unsigned)blocks, (unsigned)inodes);
