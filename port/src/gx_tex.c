@@ -143,3 +143,91 @@ int gx_decode_texture(const GxTexKey *k, uint32_t *dst, uint32_t pitch)
       for (uint32_t x = 0; x < w; x++) dst[y * pitch + x] = 0x808080FF;
    return 1;
 }
+
+// --- compact GPU formats -------------------------------------------------------------------
+// Smaller textures mean far less memory traffic when the GPU samples them:
+//  CMPR -> BC1 (the same DXT1 blocks, re-ordered): 8 times smaller than RGBA8
+//  I4/I8 -> R8, IA4/IA8 -> R8G8 (intensity, alpha): 4 and 2 times smaller
+// gx_compact_kind: 1 = BC1, 2 = R8, 3 = R8G8, 0 = RGBA8 (gx_decode_texture).
+int gx_compact_kind(uint32_t fmt)
+{
+   switch (fmt) {
+   case 0xE: return 1;
+   case 0x0: case 0x1: return 2;
+   case 0x2: case 0x3: return 3;
+   }
+   return 0;
+}
+
+static inline uint8_t rev2(uint8_t b) // CMPR: pixel 0 in the top bits; BC1: in the low bits
+{
+   return (uint8_t)(((b >> 6) & 3) | ((b >> 2) & 0x0C) | ((b << 2) & 0x30) | ((b << 6) & 0xC0));
+}
+
+// dst: BC1 blocks (8 bytes, little-endian), `pitchBlocks` blocks per row of blocks.
+void gx_decode_bc1(const GxTexKey *k, uint8_t *dst, uint32_t pitchBlocks)
+{
+   const uint8_t *s = (const uint8_t *)k->image;
+   uint32_t bw = (k->width + 3) / 4, bh = (k->height + 3) / 4;
+   for (uint32_t ty = 0; ty < bh; ty += 2)
+      for (uint32_t tx = 0; tx < bw; tx += 2)
+         for (uint32_t b = 0; b < 4; b++, s += 8) {
+            uint32_t x = tx + (b & 1), y = ty + (b >> 1);
+            if (x >= bw || y >= bh) continue;
+            uint8_t *o = dst + (y * pitchBlocks + x) * 8;
+            o[0] = s[1]; o[1] = s[0]; o[2] = s[3]; o[3] = s[2];
+            o[4] = rev2(s[4]); o[5] = rev2(s[5]); o[6] = rev2(s[6]); o[7] = rev2(s[7]);
+         }
+}
+
+// dst: R8 (kind 2) or R8G8 (kind 3, intensity then alpha); pitch in pixels.
+void gx_decode_small(const GxTexKey *k, uint8_t *dst, uint32_t pitch)
+{
+   const uint8_t *s = (const uint8_t *)k->image;
+   uint32_t w = k->width, h = k->height;
+   switch (k->fmt) {
+   case 0x0: // I4: 8x8 tiles
+      for (uint32_t ty = 0; ty < h; ty += 8)
+         for (uint32_t tx = 0; tx < w; tx += 8)
+            for (uint32_t y = 0; y < 8; y++)
+               for (uint32_t x = 0; x < 8; x += 2, s++) {
+                  uint32_t px = tx + x, py = ty + y;
+                  if (py >= h) continue;
+                  if (px < w) dst[py * pitch + px] = (uint8_t)x4(*s >> 4);
+                  if (px + 1 < w) dst[py * pitch + px + 1] = (uint8_t)x4(*s & 15);
+               }
+      break;
+   case 0x1: // I8: 8x4 tiles
+      for (uint32_t ty = 0; ty < h; ty += 4)
+         for (uint32_t tx = 0; tx < w; tx += 8)
+            for (uint32_t y = 0; y < 4; y++, s += 8) {
+               uint32_t py = ty + y;
+               if (py >= h) continue;
+               if (tx + 8 <= w) memcpy(dst + py * pitch + tx, s, 8);
+               else for (uint32_t x = 0; tx + x < w; x++) dst[py * pitch + tx + x] = s[x];
+            }
+      break;
+   case 0x2: // IA4: 8x4 tiles, alpha in the top nibble
+      for (uint32_t ty = 0; ty < h; ty += 4)
+         for (uint32_t tx = 0; tx < w; tx += 8)
+            for (uint32_t y = 0; y < 4; y++)
+               for (uint32_t x = 0; x < 8; x++, s++) {
+                  uint32_t px = tx + x, py = ty + y;
+                  if (px >= w || py >= h) continue;
+                  uint8_t *o = dst + (py * pitch + px) * 2;
+                  o[0] = (uint8_t)x4(*s & 15); o[1] = (uint8_t)x4(*s >> 4);
+               }
+      break;
+   case 0x3: // IA8: 4x4 tiles, alpha then intensity
+      for (uint32_t ty = 0; ty < h; ty += 4)
+         for (uint32_t tx = 0; tx < w; tx += 4)
+            for (uint32_t y = 0; y < 4; y++)
+               for (uint32_t x = 0; x < 4; x++, s += 2) {
+                  uint32_t px = tx + x, py = ty + y;
+                  if (px >= w || py >= h) continue;
+                  uint8_t *o = dst + (py * pitch + px) * 2;
+                  o[0] = s[1]; o[1] = s[0];
+               }
+      break;
+   }
+}

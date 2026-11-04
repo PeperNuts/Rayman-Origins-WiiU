@@ -79,6 +79,9 @@ uint32_t gx_stat(int which);
 
 // Texture decoding (gx_tex.c): Wii texture -> linear RGBA8 (width x height, pitch in pixels)
 int gx_decode_texture(const GxTexKey *k, uint32_t *dst, uint32_t pitch);
+int gx_compact_kind(uint32_t fmt);
+void gx_decode_bc1(const GxTexKey *k, uint8_t *dst, uint32_t pitchBlocks);
+void gx_decode_small(const GxTexKey *k, uint8_t *dst, uint32_t pitch);
 uint32_t gx_tex_buffer_size(uint32_t w, uint32_t h, uint32_t fmt);
 int gx_is_render_texture(uint32_t addr);
 _Static_assert(sizeof(GxState) % 8 == 0 && sizeof(GxVertex) == 72, "copied in 8-byte steps");

@@ -452,33 +452,117 @@ static uint32_t sNumTex, sTexBytes, sFrame;
 static GX2Texture sWhite;
 static uint32_t sTexStats[3]; // decoded, evicted, render targets
 
+// Textures whose contents changed before (video frames, animated UI) are compared in full:
+// 16 samples miss most changes of a video frame (flat backgrounds), which left parts of old
+// frames on screen. Everything else: 16 samples, checked once per frame.
+#define DYN_MAX 64
+static uint32_t sDynAddr[DYN_MAX], sDynCount[DYN_MAX];
+static int dyn_find(uint32_t image)
+{
+   for (int i = 0; i < DYN_MAX; i++) if (sDynAddr[i] == image) return i;
+   return -1;
+}
+static void dyn_changed(uint32_t image)
+{
+   int i = dyn_find(image);
+   if (i < 0) {
+      static uint32_t next;
+      i = (int)(next++ % DYN_MAX);
+      sDynAddr[i] = image;
+      sDynCount[i] = 0;
+   }
+   sDynCount[i]++;
+}
+
 static uint32_t content_hash(const GxTexKey *k)
 {
    uint32_t size = gx_tex_buffer_size(k->width, k->height, k->fmt);
    const uint32_t *p = (const uint32_t *)k->image;
    uint32_t n = size / 4, h = 2166136261u;
    if (!n) return 0;
+   int d = dyn_find(k->image);
+   if (d >= 0 && sDynCount[d] >= 2) {
+      uint32_t a = h, b = 0x9E3779B9u;
+      uint32_t i = 0;
+      for (; i + 4 <= n; i += 4) {
+         a = (a ^ p[i]) * 16777619u ^ p[i + 1];
+         b = (b ^ p[i + 2]) * 2246822519u ^ p[i + 3];
+      }
+      for (; i < n; i++) a = (a ^ p[i]) * 16777619u;
+      return a ^ (b * 3266489917u);
+   }
    for (uint32_t i = 0; i < 16; i++) h = (h ^ p[(uint64_t)i * (n - 1) / 15]) * 16777619u;
    return h;
 }
 
-static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile, uint32_t use)
+static int make_texture_ex(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile, uint32_t use, GX2SurfaceFormat fmt,
+                           uint32_t compMap)
 {
    memset(t, 0, sizeof(*t));
    GX2Surface *s = &t->surface;
    s->dim = GX2_SURFACE_DIM_TEXTURE_2D;
    s->width = w; s->height = h; s->depth = 1; s->mipLevels = 1;
-   s->format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+   s->format = fmt;
    s->aa = GX2_AA_MODE1X;
    s->use = (GX2SurfaceUse)use;
    s->tileMode = tile;
    t->viewNumMips = 1;
    t->viewNumSlices = 1;
-   t->compMap = 0x00010203;
+   t->compMap = compMap;
    GX2CalcSurfaceSizeAndAlignment(s);
    GX2InitTextureRegs(t);
    s->image = MEMAllocFromDefaultHeapEx(s->imageSize, s->alignment);
    return s->image != NULL;
+}
+
+static int make_texture(GX2Texture *t, uint32_t w, uint32_t h, GX2TileMode tile, uint32_t use)
+{
+   return make_texture_ex(t, w, h, tile, use, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, 0x00010203);
+}
+
+// Compact texture formats (gx_tex.c): BC1 for CMPR, R8 / R8G8 for intensity formats.
+// "nocompact" in port.cfg: everything RGBA8 as before.
+static int sCompact = -1;
+static int make_game_texture(GX2Texture *t, const GxTexKey *k, int kind)
+{
+   switch (kind) {
+   case 1: return make_texture_ex(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE,
+                                  GX2_SURFACE_FORMAT_UNORM_BC1, 0x00010203);
+   case 2: return make_texture_ex(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE,
+                                  GX2_SURFACE_FORMAT_UNORM_R8, 0x00000000); // I -> R, G, B, A
+   case 3: return make_texture_ex(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE,
+                                  GX2_SURFACE_FORMAT_UNORM_R8_G8, 0x00000001); // I -> R, G, B; A -> A
+   }
+   return make_texture(t, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE);
+}
+
+static void decode_game_texture(GX2Texture *t, const GxTexKey *k, int kind)
+{
+   GX2Surface *s = &t->surface;
+   if (kind == 1) {
+      // Is the pitch of a compressed surface counted in blocks or in pixels? Measured once on
+      // a 1024-pixel-wide surface (256 = blocks).
+      static int inPixels = -1;
+      if (inPixels < 0) {
+         GX2Surface probe;
+         memset(&probe, 0, sizeof(probe));
+         probe.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+         probe.width = 1024; probe.height = 4; probe.depth = 1; probe.mipLevels = 1;
+         probe.format = GX2_SURFACE_FORMAT_UNORM_BC1;
+         probe.aa = GX2_AA_MODE1X;
+         probe.use = GX2_SURFACE_USE_TEXTURE;
+         probe.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+         GX2CalcSurfaceSizeAndAlignment(&probe);
+         inPixels = probe.pitch >= 1024;
+         WHBLogPrintf("[tex] BC1 pitch of a 1024-wide surface: %u (%s)", (unsigned)probe.pitch, inPixels ? "pixels" : "blocks");
+      }
+      uint32_t pitch = inPixels ? s->pitch / 4 : s->pitch;
+      gx_decode_bc1(k, s->image, pitch);
+   } else if (kind) {
+      gx_decode_small(k, s->image, s->pitch);
+   } else {
+      gx_decode_texture(k, (uint32_t *)s->image, s->pitch);
+   }
 }
 
 // GPU memory still referenced by a frame in flight is freed once that frame is done:
@@ -616,6 +700,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
                return &e->tex;
             }
             video_note(k);
+            dyn_changed(k->image);
             gpu_free_later(e->tex.surface.image); // contents changed: decode again
             sTexBytes -= e->bytes;
             *e = sTex[--sNumTex];
@@ -634,10 +719,13 @@ static GX2Texture *get_texture(const GxTexKey *k)
    TexEntry *e = &sTex[sNumTex];
    memset(e, 0, sizeof(*e));
    if (sLinearTex < 0) sLinearTex = !port_cfg("tiledtex");
+   if (sCompact < 0) sCompact = !port_cfg("nocompact");
+   int kind = sCompact ? gx_compact_kind(k->fmt) : 0;
    GX2Texture stage;
-   int tiled = !sLinearTex && k->width >= 16 && k->height >= 16;
-   if (!make_texture(&e->tex, k->width, k->height, tiled ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED,
-                     GX2_SURFACE_USE_TEXTURE)) return &sWhite;
+   int tiled = !kind && !sLinearTex && k->width >= 16 && k->height >= 16;
+   if (kind ? !make_game_texture(&e->tex, k, kind)
+            : !make_texture(&e->tex, k->width, k->height, tiled ? GX2_TILE_MODE_DEFAULT : GX2_TILE_MODE_LINEAR_ALIGNED,
+                            GX2_SURFACE_USE_TEXTURE)) return &sWhite;
    if (tiled && !make_texture(&stage, k->width, k->height, GX2_TILE_MODE_LINEAR_ALIGNED, GX2_SURFACE_USE_TEXTURE)) {
       MEMFreeToDefaultHeap(e->tex.surface.image);
       return &sWhite;
@@ -649,7 +737,7 @@ static GX2Texture *get_texture(const GxTexKey *k)
       int half = icon_half(k), kind = port_pad_kind;
       GxTexKey src = *k;
       if (half && kind > 0 && kind < 3 && sIconData[kind]) src.image = (uint32_t)(sIconData[kind] + (half - 1) * ICON_HALF);
-      gx_decode_texture(&src, (uint32_t *)dec->surface.image, dec->surface.pitch);
+      decode_game_texture(dec, &src, kind);
       e->iconHalf = half;
       e->iconKind = kind;
    }
@@ -1680,12 +1768,18 @@ static int render_main(int argc, const char **argv)
       if (prevPk) gx_release_packet(prevPk);
       prevPk = pk != &idle ? pk : NULL;
       // at most two flips queued (keeps pacing at the TV rate without serialising CPU and GPU)
-      for (int guard = 0; guard < 4; guard++) {
-         uint32_t swaps, flips;
-         OSTime lf, lv;
-         GX2GetSwapStatus(&swaps, &flips, &lf, &lv);
-         if (swaps - flips <= 1) break;
-         GX2WaitForFlip();
+      // Polled with a time limit: no flips happen while the HOME Menu takes the screens, and
+      // a blocking GX2WaitForFlip would keep the renderer from parking.
+      {
+         OSTime w0 = OSGetSystemTime();
+         for (;;) {
+            uint32_t swaps, flips;
+            OSTime lf, lv;
+            GX2GetSwapStatus(&swaps, &flips, &lf, &lv);
+            if (swaps - flips <= 1 || port_paused) break;
+            if (OSGetSystemTime() - w0 > OSMillisecondsToTicks(100)) break;
+            OSSleepTicks(OSMicrosecondsToTicks(250));
+         }
       }
       sTimeFinish += OSGetSystemTime() - tf0;
       sShown++;

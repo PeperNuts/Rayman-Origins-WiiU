@@ -21,7 +21,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 64"
+#define PORT_VERSION "first-boot 65"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -151,8 +151,15 @@ volatile int port_game_parked;     // set by the game thread while it waits in V
 // twice (before and after WHBGfx's own); only the first call of a pair does anything.
 // Release: the game stops at its next frame and the renderer parks (GPU idle) before the
 // buffers go. Acquire: the renderer waits until the buffers exist again (gx_render.c).
+static uint32_t home_note(void *arg)
+{
+   WHBLogPrintf("[home] %s on CPU%d (game %s)", (const char *)arg, (int)OSGetCoreId(), port_paused ? "paused" : "running");
+   return 0;
+}
+
 static uint32_t home_release(void *arg)
 {
+   WHBLogPrintf("[home] release callback (%s) on CPU%d", arg ? "late" : "early", (int)OSGetCoreId());
    if (port_paused) return 0;
    port_paused = 1;
    for (int i = 0; i < 40 && !port_game_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
@@ -213,7 +220,10 @@ int main(int argc, char **argv)
    } else {
       OSEnableHomeButtonMenu(TRUE);
       ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_release, NULL, 255, 2);
-      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_release, NULL, 0, 2);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_release, (void *)1, 0, 2);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_note, "release message", 255, 1);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_note, "release message", 255, 0);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_note, "acquire message", 255, 1);
       ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 255, 2);
       ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 0, 2);
    }
@@ -221,8 +231,12 @@ int main(int argc, char **argv)
    // Console drawing and progress reporting run on the watchdog (CPU0), so a busy game
    // thread on CPU1 cannot freeze the screen. The main thread only serves ProcUI.
    while (WHBProcIsRunning()) {
+      static int wasFg = 1;
+      int fg = ProcUIInForeground();
+      if (fg != wasFg) { WHBLogPrintf("[home] main loop: %s", fg ? "foreground again" : "in background"); wasFg = fg; }
       OSSleepTicks(OSMillisecondsToTicks(100));
    }
+   WHBLogPrintf("[home] main loop ended (exit requested)");
 
    port_screen_free();
    WHBProcShutdown();
