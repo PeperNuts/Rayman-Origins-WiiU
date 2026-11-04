@@ -105,7 +105,8 @@ static uint32_t classic_buttons(uint32_t vh)
 // A Wii U Pro Controller sample, rewritten as the Wii's Classic Controller (same button bits).
 static void pro_to_classic(KPADStatus *s)
 {
-   uint32_t h = s->pro.hold & 0xFFFF, t = s->pro.trigger & 0xFFFF, r = s->pro.release & 0xFFFF;
+   // HOME (0x0800) belongs to the system HOME Menu, not the game's own Wii one.
+   uint32_t h = s->pro.hold & 0xF7FF, t = s->pro.trigger & 0xF7FF, r = s->pro.release & 0xF7FF;
    KPADVec2D l = s->pro.leftStick, rs = s->pro.rightStick;
    memset(&s->classic, 0, sizeof(s->classic));
    s->extensionType = WPAD_EXT_CLASSIC;
@@ -277,6 +278,11 @@ int32_t wii_KPADReadEx(int32_t chan, uint8_t *wiiBufs, uint32_t length, int32_t 
          if (s->classic.hold) port_pad_kind = 2;
       } else if (s->extensionType == WPAD_EXT_CLASSIC && s->classic.hold && !(chan == 0 && s == &buf[0] && n == 1 && sPadLastUse >= sRemoteLastUse)) {
          port_pad_kind = 0; // a real Classic Controller
+      }
+      // HOME opens the system HOME Menu; the game must not see it (its own Wii menu would open too).
+      s->hold &= ~0x8000u; s->trigger &= ~0x8000u; s->release &= ~0x8000u;
+      if (s->extensionType == WPAD_EXT_CLASSIC || s->extensionType == WPAD_EXT_MPLUS_CLASSIC) {
+         s->classic.hold &= ~0x0800u; s->classic.trigger &= ~0x0800u; s->classic.release &= ~0x0800u;
       }
       // Wii reports Nunchuk C/Z in the core button bits.
       if (s->extensionType == WPAD_EXT_NUNCHUK || s->extensionType == WPAD_EXT_MPLUS_NUNCHUK) {

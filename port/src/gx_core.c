@@ -10,6 +10,7 @@
 #include <coreinit/debug.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/spinlock.h>
+#include <coreinit/interrupts.h>
 #include <coreinit/thread.h>
 #include <whb/log.h>
 
@@ -828,9 +829,36 @@ static inline void q_barrier(void) { __asm__ volatile("sync" ::: "memory"); }
 
 static void q_process(void);
 
+// Producers: the game thread, and the game's breakpoint callback, which runs from an alarm
+// (interrupt context on the same core) and queues GXEnableBreakPt. One entry is written from
+// q_reserve to q_commit with interrupts off and a lock held (another core could also call GX),
+// so two entries never share the same place in the ring.
+static OSThread *volatile sQOwner;
+static int sQDepth, sQIrq;
+static void q_lock(void)
+{
+   int was = OSDisableInterrupts();
+   OSThread *me = OSGetCurrentThread();
+   if (sQOwner == me) { sQDepth++; return; }
+   while (!__sync_bool_compare_and_swap(&sQOwner, NULL, me)) {}
+   sQDepth = 1;
+   sQIrq = was;
+}
+static void q_unlock(void)
+{
+   if (--sQDepth) return;
+   int was = sQIrq;
+   q_barrier();
+   sQOwner = NULL;
+   q_barrier();
+   OSRestoreInterrupts(was);
+}
+
 // Producer: room for `need` bytes (header included, multiple of 16) at the head.
+// Returns with the queue locked; q_commit unlocks.
 static uint8_t *q_reserve(uint32_t need)
 {
+   q_lock();
    for (;;) {
       uint32_t h = sQHead, t = sQTail;
       if (h >= t) {
@@ -845,7 +873,13 @@ static uint8_t *q_reserve(uint32_t need)
       } else if (t - h > need) return sQ + h;
       if (sInline) { q_process(); continue; }
       sQWaits++;
+      // full: wait for the worker with the lock released (nothing written yet)
+      int depth = sQDepth;
+      sQDepth = 1;
+      q_unlock();
       OSSleepTicks(OSMicrosecondsToTicks(50));
+      q_lock();
+      sQDepth = depth;
    }
 }
 
@@ -853,18 +887,22 @@ static void q_commit(uint32_t need)
 {
    q_barrier();
    sQHead = sQHead + need;
+   q_unlock();
    if (sInline) q_process();
 }
 
 static void q_raw(void)
 {
+   q_lock(); // the stream length must not change under us (an interrupt may flush too)
    uint32_t len = (uint32_t)(port_wgp_ptr - sFifo);
+   if (!len) { q_unlock(); return; }
    uint32_t need = (sizeof(QRec) + len + 15) & ~15u;
    QRec *r = (QRec *)q_reserve(need);
    r->type = QR_RAW; r->size = need; r->len = len; r->fn = NULL;
    memcpy(r + 1, sFifo, len);
    port_wgp_ptr = sFifo;
    q_commit(need);
+   q_unlock();
 }
 
 static uint32_t sCallNeed;

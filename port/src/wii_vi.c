@@ -136,6 +136,16 @@ void wii_VIWaitForRetrace(void)
    static uint32_t lastReturn;
    static int strict = -1;
    if (strict < 0) strict = port_cfg("strictvsync");
+   // HOME Menu: the game thread waits here, between two frames, until it closes.
+   extern volatile int port_paused, port_game_parked;
+   if (port_paused && OSGetCurrentThread() == port_boot_thread()) {
+      int en = OSIsInterruptEnabled();
+      if (!en) OSEnableInterrupts();
+      port_game_parked = 1;
+      while (port_paused) OSSleepTicks(OSMillisecondsToTicks(10));
+      port_game_parked = 0;
+      if (!en) OSDisableInterrupts();
+   }
    uint32_t count = sRetraceCount;
    port_vi_frames++;
    // Adaptive: a frame that already missed its retrace continues at once instead of

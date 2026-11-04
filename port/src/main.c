@@ -21,7 +21,7 @@
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 60"
+#define PORT_VERSION "first-boot 62"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -144,17 +144,28 @@ volatile int port_paused;          // read by the renderer and the audio mixer
 volatile int port_render_parked;   // set by the renderer once it stopped using the GPU
 static int sGameSuspended;
 
+volatile int port_game_parked;     // set by the game thread while it waits in VIWaitForRetrace
+
+// Both callbacks run on CPU2, where WHBGfx frees (release) and re-creates (acquire) the
+// screen buffers. ProcUI's order between callbacks is not documented, so each is registered
+// twice (before and after WHBGfx's own); only the first call of a pair does anything.
+// Release: the game stops at its next frame and the renderer parks (GPU idle) before the
+// buffers go. Acquire: the renderer waits until the buffers exist again (gx_render.c).
 static uint32_t home_release(void *arg)
 {
+   if (port_paused) return 0;
    port_paused = 1;
-   for (int i = 0; i < 100 && !port_render_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
-   if (!sGameSuspended) { OSSuspendThread(&sGameThread); sGameSuspended = 1; }
-   WHBLogPrintf("[home] paused (renderer %s)", port_render_parked ? "parked" : "NOT parked");
+   for (int i = 0; i < 40 && !port_game_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
+   if (!port_game_parked && !sGameSuspended) { OSSuspendThread(&sGameThread); sGameSuspended = 1; }
+   for (int i = 0; i < 200 && !port_render_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
+   WHBLogPrintf("[home] paused (game %s, renderer %s)", port_game_parked ? "between frames" : "suspended",
+                port_render_parked ? "parked" : "NOT parked");
    return 0;
 }
 
 static uint32_t home_acquire(void *arg)
 {
+   if (!port_paused) return 0;
    if (sGameSuspended) { OSResumeThread(&sGameThread); sGameSuspended = 0; }
    port_paused = 0;
    WHBLogPrintf("[home] resumed");
@@ -201,8 +212,10 @@ int main(int argc, char **argv)
       OSEnableHomeButtonMenu(FALSE);
    } else {
       OSEnableHomeButtonMenu(TRUE);
-      ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, home_release, NULL, 255);
-      ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 255);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_release, NULL, 255, 2);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, home_release, NULL, 0, 2);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 255, 2);
+      ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 0, 2);
    }
 
    // Console drawing and progress reporting run on the watchdog (CPU0), so a busy game

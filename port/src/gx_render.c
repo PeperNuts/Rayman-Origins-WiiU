@@ -1498,13 +1498,21 @@ static int render_main(int argc, const char **argv)
    OSTime start = OSGetSystemTime();
    for (;;) {
       extern volatile int port_paused, port_render_parked;
-      if (port_paused || !ProcUIInForeground()) {
+      // Parked while the HOME Menu is open, and until WHBGfx has re-created the screen
+      // buffers afterwards (they do not exist in between).
+      if (port_paused || !ProcUIInForeground() || !tv->surface.image || !drc->surface.image) {
          if (!port_render_parked) {
             if (sHaveShaders) GX2DrawDone();
             port_render_parked = 1;
          }
          OSSleepTicks(OSMillisecondsToTicks(10));
          continue;
+      }
+      if (port_render_parked) {
+         OSSleepTicks(OSMillisecondsToTicks(30)); // let the acquire callbacks finish
+         if (port_paused || !tv->surface.image || !drc->surface.image) continue;
+         GX2SetTVEnable(TRUE);
+         GX2SetDRCEnable(TRUE);
       }
       port_render_parked = 0;
       if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) { selftest_init(); spec_start(); } }
