@@ -18,6 +18,20 @@
 #include <unistd.h>
 
 #include "port.h"
+#include <coreinit/interrupts.h>
+#include <coreinit/thread.h>
+
+// "nosave" in port.cfg: no NAND (the game runs without saving, as before first-boot 56).
+static int no_save(void)
+{
+   static int v = -1;
+   if (v < 0) v = port_cfg("nosave");
+   return v;
+}
+
+// Every NAND call is logged with the calling thread (start-up crash investigation).
+#define NLOG(fmt, ...) do { OSThread *t_ = OSGetCurrentThread(); \
+   WHBLogPrintf("[nand] " fmt " (thread %s, irq %d)", __VA_ARGS__, t_ && t_->name ? t_->name : "?", OSIsInterruptEnabled()); } while (0)
 
 #define SAVE_ROOT "fs:/vol/external01/rayman/save/nand"
 #define HOME_DIR "/title/00010000/53584f50/data"
@@ -64,13 +78,26 @@ static FILE *file_of(const void *info)
    return h >= 1 && h <= MAX_FILES ? sFiles[h - 1] : NULL;
 }
 
-int32_t wii_NANDGetHomeDir(char *path) { strcpy(path, HOME_DIR); return NAND_OK; }
+int32_t wii_NANDGetHomeDir(char *path)
+{
+   NLOG("get home dir -> %s", no_save() ? "none" : HOME_DIR);
+   if (no_save()) return -1;
+   strcpy(path, HOME_DIR);
+   return NAND_OK;
+}
 int32_t wii_NANDSetUserData(void *a, void *b) { return NAND_OK; }
-int32_t wii_NANDCheck(uint32_t blocks, uint32_t inodes, uint32_t *answer) { if (answer) *answer = 0; return NAND_OK; }
-void wii_NANDInitBanner(void *banner, uint32_t flag, const uint16_t *title, const uint16_t *comment) {}
+int32_t wii_NANDCheck(uint32_t blocks, uint32_t inodes, uint32_t *answer)
+{
+   NLOG("check %u blocks %u inodes", (unsigned)blocks, (unsigned)inodes);
+   if (answer) *answer = 0;
+   return NAND_OK;
+}
+void wii_NANDInitBanner(void *banner, uint32_t flag, const uint16_t *title, const uint16_t *comment) { NLOG("init banner %p", banner); }
 
 int32_t wii_NANDCreate(const char *path, uint8_t perm, uint8_t attr)
 {
+   NLOG("create %s", path);
+   if (no_save()) return -1;
    char sd[512];
    sd_path(sd, sizeof(sd), path);
    if (exists(sd)) return NAND_EXISTS;
@@ -84,6 +111,8 @@ int32_t wii_NANDCreate(const char *path, uint8_t perm, uint8_t attr)
 
 int32_t wii_NANDOpen(const char *path, void *info, uint8_t acc)
 {
+   NLOG("open %s acc %u", path, (unsigned)acc);
+   if (no_save()) return -1;
    char sd[512];
    sd_path(sd, sizeof(sd), path);
    if (!exists(sd)) { WHBLogPrintf("[nand] open %s: does not exist", path); return NAND_NOEXISTS; }
@@ -123,6 +152,7 @@ int32_t wii_NANDSimpleSafeClose(void *info) { return wii_NANDClose(info); }
 
 int32_t wii_NANDRead(void *info, void *buf, uint32_t len)
 {
+   NLOG("%s %u bytes", "read", (unsigned)len);
    FILE *f = file_of(info);
    if (!f) return NAND_INVALID;
    return (int32_t)fread(buf, 1, len, f);
@@ -130,6 +160,7 @@ int32_t wii_NANDRead(void *info, void *buf, uint32_t len)
 
 int32_t wii_NANDWrite(void *info, const void *buf, uint32_t len)
 {
+   NLOG("%s %u bytes", "write", (unsigned)len);
    FILE *f = file_of(info);
    if (!f) return NAND_INVALID;
    int32_t n = (int32_t)fwrite(buf, 1, len, f);
@@ -158,6 +189,8 @@ int32_t wii_NANDGetLength(void *info, uint32_t *len)
 
 int32_t wii_NANDMove(const char *path, const char *destDir)
 {
+   NLOG("move %s -> %s", path, destDir);
+   if (no_save()) return -1;
    char from[512], to[512], dir[512];
    sd_path(from, sizeof(from), path);
    sd_path(dir, sizeof(dir), destDir);
