@@ -1932,11 +1932,41 @@ void wii_GXSetCullMode(uint32_t mode)
 }
 typedef struct { TexObj o[1]; uint32_t map; } A_GXLoadTexObj;
 static void R_GXLoadTexObj(const void *p) { const A_GXLoadTexObj *q_ = p; (void)q_; w_GXLoadTexObj(q_->o, q_->map); }
+// Animated textures (video frames, the menu background) are copied when the game hands them
+// to GX: the port reports "GPU done" long before the renderer reads them, so the game was
+// already writing the next frame into the same memory (frames mixed in bands). The copy lives
+// in a 16 MB ring, used for one frame only (gx_render.c, gx_snapshot_ring).
+#define SNAP_SIZE (16u << 20)
+static uint8_t *sSnap;
+static uint32_t sSnapPos;
+void gx_snapshot_ring(uint32_t *lo, uint32_t *hi)
+{
+   *lo = (uint32_t)sSnap;
+   *hi = (uint32_t)sSnap + (sSnap ? SNAP_SIZE : 0);
+}
+static uint32_t snapshot(const GxTexKey *k)
+{
+   static int off = -1;
+   if (off < 0) off = port_cfg("nosnapshot");
+   if (off || !k->image || gx_is_render_texture(k->image) || !gx_tex_is_dynamic(k->image)) return 0;
+   uint32_t size = gx_tex_buffer_size(k->width, k->height, k->fmt);
+   if (!size || size > SNAP_SIZE / 8) return 0;
+   if (!sSnap) sSnap = MEMAllocFromDefaultHeapEx(SNAP_SIZE, 64);
+   if (!sSnap) return 0;
+   if (sSnapPos + size > SNAP_SIZE) sSnapPos = 0;
+   uint8_t *dst = sSnap + sSnapPos;
+   memcpy(dst, (const void *)k->image, size);
+   sSnapPos = (sSnapPos + size + 63) & ~63u;
+   return (uint32_t)dst;
+}
+
 void wii_GXLoadTexObj(const TexObj *o, uint32_t map)
 {
    FLUSH();
+   uint32_t snap = snapshot(&o->key);
    A_GXLoadTexObj *q_ = q_call(R_GXLoadTexObj, sizeof(A_GXLoadTexObj));
    (void)q_; memcpy(q_->o, o, sizeof(q_->o)); q_->map = map;
+   if (snap) q_->o[0].key.image = snap;
    Q_DONE();
 }
 typedef struct { uint8_t rgba[4]; uint32_t z; } A_GXSetCopyClear;

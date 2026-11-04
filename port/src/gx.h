@@ -84,4 +84,6 @@ void gx_decode_bc1(const GxTexKey *k, uint8_t *dst, uint32_t pitchBlocks);
 void gx_decode_small(const GxTexKey *k, uint8_t *dst, uint32_t pitch);
 uint32_t gx_tex_buffer_size(uint32_t w, uint32_t h, uint32_t fmt);
 int gx_is_render_texture(uint32_t addr);
+int gx_tex_is_dynamic(uint32_t image);                  // gx_render.c: contents changed repeatedly
+void gx_snapshot_ring(uint32_t *lo, uint32_t *hi);      // gx_core.c: copies of animated textures
 _Static_assert(sizeof(GxState) % 8 == 0 && sizeof(GxVertex) == 72, "copied in 8-byte steps");

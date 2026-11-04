@@ -474,6 +474,12 @@ static void dyn_changed(uint32_t image)
    sDynCount[i]++;
 }
 
+int gx_tex_is_dynamic(uint32_t image)
+{
+   int i = dyn_find(image);
+   return i >= 0 && sDynCount[i] >= 2;
+}
+
 static uint32_t content_hash(const GxTexKey *k)
 {
    uint32_t size = gx_tex_buffer_size(k->width, k->height, k->fmt);
@@ -699,14 +705,17 @@ static GX2Texture *get_texture(const GxTexKey *k)
          if (e->key.width == k->width && e->key.height == k->height && e->key.fmt == k->fmt) {
             extern volatile int port_pad_kind;
             if (e->iconHalf && e->iconKind != port_pad_kind) e->checked = 0, e->hash ^= 1; // other controller: decode again
-            if (e->checked == sFrame || e->hash == content_hash(k)) {
+            // a copy of an animated texture (gx_core.c) is valid for the frame it was made in
+            uint32_t snapLo, snapHi;
+            gx_snapshot_ring(&snapLo, &snapHi);
+            int snapshot = k->image >= snapLo && k->image < snapHi;
+            if (snapshot ? e->lastUsed == sFrame : (e->checked == sFrame || e->hash == content_hash(k))) {
                e->checked = sFrame;
                e->lastUsed = sFrame;
                sTexSlot[slot] = (uint16_t)i;
                return &e->tex;
             }
-            video_note(k);
-            dyn_changed(k->image);
+            if (!snapshot) { video_note(k); dyn_changed(k->image); }
             gpu_free_later(e->tex.surface.image); // contents changed: decode again
             sTexBytes -= e->bytes;
             *e = sTex[--sNumTex];
