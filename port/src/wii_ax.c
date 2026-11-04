@@ -192,6 +192,146 @@ static void mix_frame(int32_t *accL, int32_t *accR)
       if (sV[i].used) publish(&sV[i]);
 }
 
+// ---------------------------------------------------------------------------------------
+// Bink video sound: BinkOpenAX hands Bink a driver (BINKSND callbacks). Bink copies decoded
+// interleaved s16 PCM into a ring here; the mixer resamples it to 32 kHz.
+// ---------------------------------------------------------------------------------------
+#define MAX_BINK 4
+#define BINK_FRAMES 16384 // ring per track, in sample frames (~0.35 s at 48 kHz)
+typedef struct {
+   uint8_t *bs;
+   int used, paused, on;
+   uint32_t freq, chans, step, frac;
+   int16_t *buf;
+   volatile uint32_t rd, wr; // frames, monotonic
+   int32_t vol;              // 0..32768
+   int32_t l0, r0, l1, r1;
+} BinkTrack;
+static BinkTrack sBink[MAX_BINK];
+
+static BinkTrack *bink_of(void *bs)
+{
+   for (int i = 0; i < MAX_BINK; i++)
+      if (sBink[i].used && sBink[i].bs == bs) return &sBink[i];
+   return NULL;
+}
+
+static int bink_next(BinkTrack *t)
+{
+   if (t->wr - t->rd < 1) return 0;
+   const int16_t *f = t->buf + (t->rd % BINK_FRAMES) * t->chans;
+   t->l0 = t->l1; t->r0 = t->r1;
+   t->l1 = f[0];
+   t->r1 = t->chans > 1 ? f[1] : f[0];
+   t->rd++;
+   return 1;
+}
+
+static void mix_bink(int32_t *accL, int32_t *accR)
+{
+   for (int i = 0; i < MAX_BINK; i++) {
+      BinkTrack *t = &sBink[i];
+      if (!t->used || t->paused || !t->on) continue;
+      for (int n = 0; n < FRAME; n++) {
+         int32_t f = (int32_t)(t->frac >> 1);
+         int32_t l = t->l0 + (((t->l1 - t->l0) * f) >> 15), r = t->r0 + (((t->r1 - t->r0) * f) >> 15);
+         accL[n] += (l * t->vol) >> 15;
+         accR[n] += (r * t->vol) >> 15;
+         t->frac += t->step;
+         while (t->frac >= 0x10000) {
+            t->frac -= 0x10000;
+            if (!bink_next(t)) { t->frac = 0; break; } // starved: hold
+         }
+      }
+   }
+}
+
+static int32_t bink_ready(uint8_t *bs)
+{
+   BinkTrack *t = bink_of(bs);
+   return t && BINK_FRAMES - (t->wr - t->rd) >= 256;
+}
+
+static int32_t bink_lock(uint8_t *bs, uint8_t **addr, uint32_t *len)
+{
+   BinkTrack *t = bink_of(bs);
+   if (!t) return 0;
+   uint32_t used = t->wr - t->rd, free = BINK_FRAMES - used;
+   uint32_t at = t->wr % BINK_FRAMES, run = BINK_FRAMES - at;
+   if (run > free) run = free;
+   if (!run) return 0;
+   *addr = (uint8_t *)(t->buf + at * t->chans);
+   *len = run * t->chans * 2;
+   return 1;
+}
+
+static int32_t bink_unlock(uint8_t *bs, uint32_t filled)
+{
+   BinkTrack *t = bink_of(bs);
+   if (!t) return 0;
+   __asm__ volatile("sync" ::: "memory");
+   t->wr += filled / (t->chans * 2);
+   return 1;
+}
+
+static void bink_volume(uint8_t *bs, int32_t vol)
+{
+   BinkTrack *t = bink_of(bs);
+   if (t) t->vol = vol < 0 ? 0 : vol > 65536 ? 65536 : vol;
+}
+static void bink_pan(uint8_t *bs, int32_t pan) {}
+static int32_t bink_pause(uint8_t *bs, int32_t status)
+{
+   BinkTrack *t = bink_of(bs);
+   if (t && status >= 0) t->paused = status != 0;
+   return t ? t->paused : 0;
+}
+static int32_t bink_onoff(uint8_t *bs, int32_t on)
+{
+   BinkTrack *t = bink_of(bs);
+   if (t && on >= 0) t->on = on != 0;
+   return t ? t->on : 0;
+}
+static void bink_close(uint8_t *bs)
+{
+   BinkTrack *t = bink_of(bs);
+   if (!t) return;
+   int en = OSDisableInterrupts();
+   t->used = 0;
+   OSRestoreInterrupts(en);
+}
+
+// BINKSND layout (Bink 1.9x, Wii): Bink's own ring and sizes up to 0x5C, the driver
+// callbacks from 0x15C. Latency (ms) at 0x38.
+static int32_t bink_open(uint8_t *bs, uint32_t freq, int32_t bits, int32_t chans, uint32_t flags, void *bink)
+{
+   if (!sRingL || bits != 16 || chans < 1 || chans > 2 || !freq) return 0;
+   BinkTrack *t = NULL;
+   for (int i = 0; i < MAX_BINK; i++) if (!sBink[i].used) { t = &sBink[i]; break; }
+   if (!t) return 0;
+   if (!t->buf) t->buf = MEMAllocFromDefaultHeapEx(BINK_FRAMES * 2 * 2, 64);
+   if (!t->buf) return 0;
+   int en = OSDisableInterrupts();
+   t->bs = bs;
+   t->freq = freq; t->chans = (uint32_t)chans;
+   t->step = (uint32_t)(((uint64_t)freq << 16) / 32000);
+   t->frac = 0; t->rd = t->wr = 0;
+   t->vol = 32768; t->paused = 0; t->on = 1;
+   t->l0 = t->r0 = t->l1 = t->r1 = 0;
+   t->used = 1;
+   OSRestoreInterrupts(en);
+   static void *const fns[9] = {(void *)bink_ready, (void *)bink_lock, (void *)bink_unlock, (void *)bink_volume,
+                                (void *)bink_pan, (void *)bink_pause, (void *)bink_onoff, (void *)bink_close, NULL};
+   memcpy(bs + 0x15C, fns, sizeof(fns));
+   uint32_t latency = 30, best = 0;
+   memcpy(bs + 0x38, &latency, 4);
+   memcpy(bs + 0x2C, &best, 4);
+   WHBLogPrintf("[ax] Bink sound track: %u Hz, %d channels", (unsigned)freq, (int)chans);
+   return 1;
+}
+
+void *wii_BinkOpenAX(uint32_t param) { return port_cfg("nobinksound") ? NULL : (void *)bink_open; }
+
 static inline int16_t clamp16(int32_t x) { return (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x); }
 
 // One AX frame: mix into the ring, then the game's AX callback prepares the next one.
@@ -199,6 +339,7 @@ static void produce(void)
 {
    static int32_t accL[FRAME], accR[FRAME];
    mix_frame(accL, accR);
+   mix_bink(accL, accR);
    uint32_t at = (sProduced % RING_FRAMES) * FRAME;
    for (int n = 0; n < FRAME; n++) { sRingL[at + n] = clamp16(accL[n]); sRingR[at + n] = clamp16(accR[n]); }
    DCFlushRange(sRingL + at, FRAME * 2);

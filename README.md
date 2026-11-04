@@ -31,7 +31,7 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Split screens: TV status page, GamePad log | ✅ first-boot 16 |
 | GX2 renderer stage 1: GX2 on CPU2, TV shows the game's copy-clear colour, GamePad log | ✅ first-boot 17 |
 | GX emulation: FIFO capture, vertex decoding, TEV shaders (CafeGLSL), textures, EFB copies | ✅ the game renders fully and is playable (first-boot 37); performance and video fixes in progress |
-| Audio: software AX mixer (DSP-ADPCM/PCM voices) → Wii U sndcore2, TV + GamePad | ✅ first version (first-boot 51), untested on hardware; Bink video sound not yet |
+| Audio: software AX mixer (DSP-ADPCM/PCM voices) → Wii U sndcore2, TV + GamePad | ✅ first version (first-boot 52, incl. Bink video sound), untested on hardware |
 | Wii U GamePad: player 1 (as Wii Remote + Nunchuk), game picture on the GamePad (L3+R3 toggles the log), rumble | ✅ first-boot 46–51 |
 | GX work on its own core (CPU0 worker), CPU/GPU frame pipelining | ✅ first-boot 44–50 |
 | Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
