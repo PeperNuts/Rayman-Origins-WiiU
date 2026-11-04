@@ -3,8 +3,8 @@
 //
 // On the Wii these live in wii_rrthreads.c / wii_rratomics.cpp (replaced). Bink asserts
 // (trap) when creation fails, so they must really work. Objects live in caller memory of
-// unknown size, so each is mapped to a Cafe object. Bink threads run on the game core,
-// like everything else that touches game state.
+// unknown size, so each is mapped to a Cafe object. Bink's helper threads (IO, sound) run on
+// CPU2 (the render core has time to spare); "radcpu1" in port.cfg keeps them on the game core.
 #include <coreinit/interrupts.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/mutex.h>
@@ -27,14 +27,21 @@ static int timed_out(OSTime start, uint32_t ms)
 }
 
 // ---------------------------------------------------------------------------------------
-// Atomics: every game thread runs on one core, so an interrupts-off section is atomic.
+// Atomics: RAD's own threads run on another core than the game (see rrThreadCreate),
+// so this is a real multi-core atomic (lwarx/stwcx.).
 // ---------------------------------------------------------------------------------------
 int32_t wii_rrAtomicAddExchange32(volatile int32_t *addr, int32_t add)
 {
-   int en = OSDisableInterrupts();
-   int32_t old = *addr;
-   *addr = old + add;
-   OSRestoreInterrupts(en);
+   int32_t old, tmp;
+   __asm__ volatile("sync\n"
+                    "1: lwarx %0,0,%2\n"
+                    "   add %1,%0,%3\n"
+                    "   stwcx. %1,0,%2\n"
+                    "   bne- 1b\n"
+                    "   isync"
+                    : "=&r"(old), "=&r"(tmp)
+                    : "r"(addr), "r"(add)
+                    : "cc", "memory");
    return old;
 }
 
@@ -173,7 +180,7 @@ int wii_rrThreadCreate(void *t, void *func, uint32_t stackSize, void *data, int3
    if (priority > 31) priority = 31;
    strncpy(r->name, name ? name : "rad", sizeof(r->name) - 1);
    if (!OSCreateThread(&r->thread, (OSThreadEntryPointFn)rr_thread_entry, 0, (void *)r, r->stack + stackSize,
-                       stackSize, priority, OS_THREAD_ATTRIB_AFFINITY_CPU1)) {
+                       stackSize, priority, port_cfg("radcpu1") ? OS_THREAD_ATTRIB_AFFINITY_CPU1 : OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
       r->running = 0;
       return 0;
    }

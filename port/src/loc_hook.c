@@ -6,6 +6,7 @@
 // asks for text 9049 (GamePad) or 9050 (Pro Controller) instead, which tools/loc_patch.py adds
 // to the localisation file in sd:/rayman/mods. Without that file the original text is used.
 #include <stdint.h>
+#include <whb/log.h>
 
 typedef void (*GetTextFn)(void *ret, void *tmpl, const uint32_t *id, uint32_t lang);
 // Distance from port_loc_gettext to Localisation_Template::getText (a local symbol of the game
@@ -21,6 +22,11 @@ void port_loc_gettext(void *ret, void *tmpl, const uint32_t *id, uint32_t lang)
 {
    uint32_t alt;
    const uint32_t *use = id;
+   static int logged;
+   if ((*id == 4048 || *id == 4049) && logged < 12) {
+      logged++;
+      WHBLogPrintf("[loc] text %u asked, controller %d, pad texts %d", (unsigned)*id, (int)port_pad_kind, (int)port_loc_has_pad_texts);
+   }
    if (*id == 4049 && port_loc_has_pad_texts && (port_pad_kind == 1 || port_pad_kind == 2)) {
       alt = port_pad_kind == 1 ? 9049 : 9050;
       use = &alt;

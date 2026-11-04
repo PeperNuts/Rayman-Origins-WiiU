@@ -527,8 +527,16 @@ static void icons_load(void)
 // 0, or 1/2 for the colour/alpha half of the Classic Controller picture.
 static int icon_half(const GxTexKey *k)
 {
-   if (k->fmt != 14 || k->width != 256 || k->height != 256) return 0;
+   if (k->width != 256 || k->height != 256) return 0;
    uint32_t h = fnv_full((const uint8_t *)k->image, 32768);
+   static int logged;
+   if (logged < 40) {
+      logged++;
+      const uint8_t *b = (const uint8_t *)k->image;
+      WHBLogPrintf("[tex] 256x256 fmt %u at %08X hash %08X first %02X%02X%02X%02X%02X%02X%02X%02X", k->fmt, (unsigned)k->image,
+                   (unsigned)h, b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
+   }
+   if (k->fmt != 14) return 0;
    return h == kIconHash[0] ? 1 : h == kIconHash[1] ? 2 : 0;
 }
 
@@ -1489,10 +1497,16 @@ static int render_main(int argc, const char **argv)
    uint32_t lastReport = 0;
    OSTime start = OSGetSystemTime();
    for (;;) {
-      if (!ProcUIInForeground()) {
-         OSSleepTicks(OSMillisecondsToTicks(50));
+      extern volatile int port_paused, port_render_parked;
+      if (port_paused || !ProcUIInForeground()) {
+         if (!port_render_parked) {
+            if (sHaveShaders) GX2DrawDone();
+            port_render_parked = 1;
+         }
+         OSSleepTicks(OSMillisecondsToTicks(10));
          continue;
       }
+      port_render_parked = 0;
       if (sShaderDone && sCompiled && !sHaveShaders && !sCfgNoEfb) { sHaveShaders = finish_shaders(); if (sHaveShaders) { selftest_init(); spec_start(); } }
       static GxPacket idle = {.black = 1};
       GxPacket *pk = gx_acquire_packet();

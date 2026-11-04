@@ -13,13 +13,14 @@
 #include <whb/log_console.h>
 #include <whb/log_udp.h>
 #include <whb/proc.h>
+#include <proc_ui/procui.h>
 
 #include <stdio.h>
 #include <string.h>
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 55"
+#define PORT_VERSION "first-boot 56"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -126,12 +127,36 @@ int port_cfg(const char *word)
    return 0;
 }
 
+// ---------------------------------------------------------------------------------------
+// HOME Menu / background: ProcUI callbacks on the main thread (inside WHBProcIsRunning)
+// ---------------------------------------------------------------------------------------
+volatile int port_paused;          // read by the renderer and the audio mixer
+volatile int port_render_parked;   // set by the renderer once it stopped using the GPU
+static int sGameSuspended;
+
+static uint32_t home_release(void *arg)
+{
+   port_paused = 1;
+   for (int i = 0; i < 100 && !port_render_parked; i++) OSSleepTicks(OSMillisecondsToTicks(5));
+   if (!sGameSuspended) { OSSuspendThread(&sGameThread); sGameSuspended = 1; }
+   WHBLogPrintf("[home] paused (renderer %s)", port_render_parked ? "parked" : "NOT parked");
+   return 0;
+}
+
+static uint32_t home_acquire(void *arg)
+{
+   if (sGameSuspended) { OSResumeThread(&sGameThread); sGameSuspended = 0; }
+   port_paused = 0;
+   WHBLogPrintf("[home] resumed");
+   return 0;
+}
+
 int main(int argc, char **argv)
 {
    WHBProcInit();
-   // Test builds: the system HOME Menu would take the screen away while the game keeps
-   // running in the background, which has hung the console. Exit = hold POWER.
-   OSEnableHomeButtonMenu(FALSE);
+   // The system HOME Menu: while it is open the game thread is suspended, the renderer is
+   // parked (GPU idle) and the audio plays silence (home_release/home_acquire below).
+   // "nohome" in port.cfg disables it (the HOME button then does nothing).
    port_screen_init(); // TV: status page, GamePad: log
    port_log_udp_start(); // UDP from one sender thread only
    WHBLogPrintf("== Rayman Origins Wii U port - %s ==", PORT_VERSION);
@@ -162,6 +187,13 @@ int main(int argc, char **argv)
    }
    OSSetThreadName(&sGameThread, "Rayman game");
    OSResumeThread(&sGameThread);
+   if (port_cfg("nohome")) {
+      OSEnableHomeButtonMenu(FALSE);
+   } else {
+      OSEnableHomeButtonMenu(TRUE);
+      ProcUIRegisterCallback(PROCUI_CALLBACK_RELEASE, home_release, NULL, 255);
+      ProcUIRegisterCallback(PROCUI_CALLBACK_ACQUIRE, home_acquire, NULL, 255);
+   }
 
    // Console drawing and progress reporting run on the watchdog (CPU0), so a busy game
    // thread on CPU1 cannot freeze the screen. The main thread only serves ProcUI.

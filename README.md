@@ -34,7 +34,8 @@ NAND, WPAD/KPAD, …) — with an implementation on top of Cafe OS, and links th
 | Audio: software AX mixer (DSP-ADPCM/PCM voices) → Wii U sndcore2, TV + GamePad | ✅ first version (first-boot 52, incl. Bink video sound), untested on hardware |
 | Wii U GamePad and Pro Controller as Classic Controllers (game picture on the GamePad, L3+R3 toggles the log, rumble); the game names and pictures the controller in use (GamePad / Pro Controller / Classic Controller) with the files from `port/tools` in `sd:/rayman/mods` | ✅ first-boot 46–55 |
 | GX work on its own core (CPU0 worker), CPU/GPU frame pipelining | ✅ first-boot 44–50 |
-| Graphics (GX → GX2), audio (AX), input (WPAD/KPAD → Wii U), saves (NAND) | ⏳ |
+| Saves: Wii NAND file system on the SD card (sd:/rayman/save) | ✅ first version (first-boot 56) |
+| Wii U HOME Menu (game paused, renderer parked, audio silent while it is open) | ✅ first version (first-boot 56) |
 
 With a Wii Remote, the game goes from Health & Safety through the main menu into the prologue level and starts the intro video. Since first-boot 37 the game renders fully on the TV through the GX→GX2 renderer and is playable with a Wii Remote + Nunchuk (no sound yet).
 

@@ -338,6 +338,14 @@ static inline int16_t clamp16(int32_t x) { return (int16_t)(x > 32767 ? 32767 : 
 static void produce(void)
 {
    static int32_t accL[FRAME], accR[FRAME];
+   extern volatile int port_paused;
+   if (port_paused) { // HOME Menu: silence, the game's sound engine is not run
+      uint32_t at = (sProduced % RING_FRAMES) * FRAME;
+      memset(sRingL + at, 0, FRAME * 2); memset(sRingR + at, 0, FRAME * 2);
+      DCFlushRange(sRingL + at, FRAME * 2); DCFlushRange(sRingR + at, FRAME * 2);
+      sProduced++;
+      return;
+   }
    mix_frame(accL, accR);
    mix_bink(accL, accR);
    uint32_t at = (sProduced % RING_FRAMES) * FRAME;
