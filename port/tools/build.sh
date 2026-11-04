@@ -15,7 +15,7 @@ python3 -I tools/gen_stubs.py game/undef.txt game/undef_info.json game/config/SO
     game/orig/SOJP41/sys/main.dol src gen/stubs.S
 
 CFLAGS=(--target=powerpc-unknown-eabi -mcpu=750 -mhard-float -O2 -g -fno-pic -fno-common
-        -ffunction-sections -fno-builtin-printf -Wall -Werror=implicit-function-declaration
+        -ffunction-sections -fno-builtin-printf -Wall -Wshadow -Werror=implicit-function-declaration
         -nostdinc -isystem "$(clang -print-resource-dir)/include"
         -isystem "$DKP/wut/include" -isystem "$DKP/devkitPPC/powerpc-eabi/include"
         -D__WIIU__ -D__WUT__ -DESPRESSO -Isrc)

@@ -751,12 +751,12 @@ static GX2Texture *get_texture(const GxTexKey *k)
    {
       extern volatile int port_pad_kind;
       icons_load();
-      int half = icon_half(k), kind = port_pad_kind;
+      int half = icon_half(k), pad = port_pad_kind; // (was named 'kind', hiding the texture format kind)
       GxTexKey src = *k;
-      if (half && kind > 0 && kind < 3 && sIconData[kind]) src.image = (uint32_t)(sIconData[kind] + (half - 1) * ICON_HALF);
+      if (half && pad > 0 && pad < 3 && sIconData[pad]) src.image = (uint32_t)(sIconData[pad] + (half - 1) * ICON_HALF);
       decode_game_texture(dec, &src, kind);
       e->iconHalf = half;
-      e->iconKind = kind;
+      e->iconKind = pad;
    }
    DCFlushRange(dec->surface.image, dec->surface.imageSize);
    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, dec->surface.image, dec->surface.imageSize);
