@@ -207,6 +207,7 @@ typedef struct {
    int32_t vol;              // 0..32768
    int32_t l0, r0, l1, r1;
    uint8_t *bink; // the BINK the track belongs to (diagnostics)
+   volatile int stalled; // last hand-over was empty: not ready until the mixer played a frame
 } BinkTrack;
 static BinkTrack sBink[MAX_BINK];
 // Diagnostics (video sound): calls and data per second, logged by the watch thread.
@@ -217,7 +218,8 @@ void port_bink_stats(void)
       BinkTrack *t = &sBink[i];
       if (!t->used) continue;
       uint8_t *bs = t->bs;
-      uint32_t w2c, w54, w0, w18;
+      uint32_t w2c, w54, w0, w18, w30, w40;
+      memcpy(&w30, bs + 0x30, 4); memcpy(&w40, bs + 0x40, 4);
       memcpy(&w2c, bs + 0x2C, 4); memcpy(&w54, bs + 0x54, 4); memcpy(&w0, bs, 4); memcpy(&w18, bs + 0x18, 4);
       // Bink's sound pump (pump_sound / checksound) only reaches the driver when these allow it
       extern char _SDA_BASE_[];
@@ -230,10 +232,10 @@ void port_bink_stats(void)
                    "snd %08X (bs %p), bs+0x4C %d", (unsigned)g9c, (unsigned)g7c, (unsigned)g80, (unsigned)g20, t->bink,
                    (unsigned)b124, (unsigned)b12c, (unsigned)b460, (unsigned)b154, bs, (int)s4c);
       WHBLogPrintf("[bink] track %d: ready %u (yes %u), lock %u, %u bytes in, %u frames mixed, starved %u, "
-                   "buffered %u, vol %d, on %d, paused %d | bs 0x00 %08X 0x18 %08X 0x2C %08X 0x54 %08X",
+                   "buffered %u, vol %d, on %d, paused %d | bs 0x00 %08X 0x18 %08X 0x2C %08X 0x30 %08X 0x40 %08X 0x54 %08X",
                    i, (unsigned)sBkReady, (unsigned)sBkReadyYes, (unsigned)sBkLock, (unsigned)sBkUnlockBytes,
                    (unsigned)sBkMixed, (unsigned)sBkStarved, (unsigned)(t->wr - t->rd), (int)t->vol, t->on, t->paused,
-                   (unsigned)w0, (unsigned)w18, (unsigned)w2c, (unsigned)w54);
+                   (unsigned)w0, (unsigned)w18, (unsigned)w2c, (unsigned)w30, (unsigned)w40, (unsigned)w54);
    }
    sBkReady = sBkReadyYes = sBkLock = sBkUnlockBytes = sBkMixed = sBkStarved = 0;
 }
@@ -260,6 +262,7 @@ static void mix_bink(int32_t *accL, int32_t *accR)
 {
    for (int i = 0; i < MAX_BINK; i++) {
       BinkTrack *t = &sBink[i];
+      t->stalled = 0; // once per mixer frame (3 ms) Bink may try again
       if (!t->used || t->paused || !t->on) continue;
       sBkMixed += FRAME;
       for (int n = 0; n < FRAME; n++) {
@@ -280,7 +283,7 @@ static int32_t bink_ready(uint8_t *bs)
 {
    BinkTrack *t = bink_of(bs);
    sBkReady++;
-   int r = t && BINK_FRAMES - (t->wr - t->rd) >= 256;
+   int r = t && !t->stalled && BINK_FRAMES - (t->wr - t->rd) >= 256;
    sBkReadyYes += r;
    return r;
 }
@@ -305,6 +308,7 @@ static int32_t bink_unlock(uint8_t *bs, uint32_t filled)
    if (!t) return 0;
    __asm__ volatile("sync" ::: "memory");
    sBkUnlockBytes += filled;
+   if (!filled) t->stalled = 1; // Bink's pump loops while ready: never spin on empty hand-overs
    t->wr += filled / (t->chans * 2);
    return 1;
 }
@@ -359,9 +363,13 @@ static int32_t bink_open(uint8_t *bs, uint32_t freq, int32_t bits, int32_t chans
    static void *const fns[9] = {(void *)bink_ready, (void *)bink_lock, (void *)bink_unlock, (void *)bink_volume,
                                 (void *)bink_pan, (void *)bink_pause, (void *)bink_onoff, (void *)bink_close, NULL};
    memcpy(bs + 0x15C, fns, sizeof(fns));
-   uint32_t latency = 30, best = 0, status = 0;
+   // BestSizeIn16 (0x2C) and BestSizeMask (0x30) are the driver's: Bink masks each hand-over
+   // with the mask, so garbage there made every hand-over 0 bytes. Whole stereo s16 frames.
+   uint32_t latency = 30, best = 0, status = 0, mask = 0xFFFFFFFC;
    memcpy(bs + 0x38, &latency, 4);
    memcpy(bs + 0x2C, &best, 4);
+   memcpy(bs + 0x30, &mask, 4);
+   t->stalled = 0;
    // Track status, set by the driver's open: Bink pumps sound to the driver only while it is
    // 0 or 2 (1 = failed, negative = not ready yet). Left unset it held garbage: no video sound.
    memcpy(bs + 0x4C, &status, 4);
