@@ -359,9 +359,22 @@ static int32_t bink_open(uint8_t *bs, uint32_t freq, int32_t bits, int32_t chans
    static void *const fns[9] = {(void *)bink_ready, (void *)bink_lock, (void *)bink_unlock, (void *)bink_volume,
                                 (void *)bink_pan, (void *)bink_pause, (void *)bink_onoff, (void *)bink_close, NULL};
    memcpy(bs + 0x15C, fns, sizeof(fns));
-   uint32_t latency = 30, best = 0;
+   uint32_t latency = 30, best = 0, status = 0;
    memcpy(bs + 0x38, &latency, 4);
    memcpy(bs + 0x2C, &best, 4);
+   // Track status, set by the driver's open: Bink pumps sound to the driver only while it is
+   // 0 or 2 (1 = failed, negative = not ready yet). Left unset it held garbage: no video sound.
+   memcpy(bs + 0x4C, &status, 4);
+   {
+      uint32_t w[24];
+      memcpy(w, bs, sizeof(w));
+      WHBLogPrintf("[bink] BINKSND %p: %08X %08X %08X %08X %08X %08X %08X %08X | %08X %08X %08X %08X %08X %08X %08X %08X | "
+                   "%08X %08X %08X %08X %08X %08X %08X %08X", bs, (unsigned)w[0], (unsigned)w[1], (unsigned)w[2],
+                   (unsigned)w[3], (unsigned)w[4], (unsigned)w[5], (unsigned)w[6], (unsigned)w[7], (unsigned)w[8],
+                   (unsigned)w[9], (unsigned)w[10], (unsigned)w[11], (unsigned)w[12], (unsigned)w[13], (unsigned)w[14],
+                   (unsigned)w[15], (unsigned)w[16], (unsigned)w[17], (unsigned)w[18], (unsigned)w[19], (unsigned)w[20],
+                   (unsigned)w[21], (unsigned)w[22], (unsigned)w[23]);
+   }
    WHBLogPrintf("[ax] Bink sound track: %u Hz, %d channels", (unsigned)freq, (int)chans);
    return 1;
 }
