@@ -18,6 +18,20 @@ sd-files/
 patched_asm/
 game_final.o
 undef_info.json
+*.loc
+
+# --- Installable titles, keys, personal pictures and sounds ---
+*.app
+*.h3
+*.tmd
+*.tik
+*.cert
+encryptKeyWith
+*.bin
+*.tga
+*.btsnd
+*.h264
+*.rpl
 
 # --- Build output / local toolchains ---
 build/

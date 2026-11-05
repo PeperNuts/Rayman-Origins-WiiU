@@ -27,4 +27,4 @@ for (bx, by) in ((214, 132), (214, 164), (198, 148), (230, 148)):
 mask = mask.filter(ImageFilter.MaxFilter(3))
 col = col.resize((256, 256), Image.LANCZOS); mask = mask.resize((256, 256), Image.LANCZOS)
 img = col.convert('RGBA'); img.putalpha(mask)
-img.save('/tmp/claude-0/img/gamepad_icon.png')
+import sys; img.save(sys.argv[1] if len(sys.argv) > 1 else 'gamepad_icon.png')

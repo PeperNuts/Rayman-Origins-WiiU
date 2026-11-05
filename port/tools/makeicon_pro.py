@@ -28,4 +28,4 @@ circ(cd, 160, 146, 18, outline=WH, width=LW * S); circ(cd, 160, 146, 6, fill=WH)
 for x in (116, 140): circ(cd, x, 96, 4, fill=WH)                                   # - +
 col = col.resize((256, 256), Image.LANCZOS); mask = mask.resize((256, 256), Image.LANCZOS)
 img = col.convert('RGBA'); img.putalpha(mask)
-img.save('/tmp/claude-0/img/pro_icon.png')
+import sys; img.save(sys.argv[1] if len(sys.argv) > 1 else 'pro_icon.png')
