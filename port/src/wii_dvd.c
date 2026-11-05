@@ -20,7 +20,19 @@
 
 #include "port.h"
 
-#define DISC_ROOT "fs:/vol/external01/rayman/files"
+static const char *disc_root(void)
+{
+   static char p[64];
+   if (!p[0]) snprintf(p, sizeof(p), "%s/files", port_data_root());
+   return p;
+}
+static const char *mods_root(void)
+{
+   static char p[64];
+   if (!p[0]) snprintf(p, sizeof(p), "%s/mods", port_data_root());
+   return p;
+}
+#define DISC_ROOT disc_root()
 
 // Wii structures (RVL SDK layout)
 typedef struct WiiDVDCommandBlock {
@@ -58,7 +70,7 @@ static char *sEntryPath[MAX_ENTRIES];
 static uint32_t sEntrySize[MAX_ENTRIES];
 static int32_t sEntryCount;
 
-#define MODS_ROOT "fs:/vol/external01/rayman/mods"
+#define MODS_ROOT mods_root()
 static char *sEntryReal[MAX_ENTRIES]; // resolved SD path (a mod file replaces the disc file)
 
 // sd:/rayman/mods/<path> replaces disc file <path> when it exists (e.g. edited text).

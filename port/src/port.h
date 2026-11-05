@@ -43,6 +43,12 @@ void port_render_start(void);
 void port_shaders_prepare(void);
 int gx_describe(char *buf, int size);
 int port_cfg(const char *word);
+// Where the game data lives: an installed title carries it in its own content
+// ("fs:/vol/content": files/, mods/) and saves in its save area; started from the SD card
+// (.rpx / .wuhb), everything is under sd:/rayman as before (main.c).
+extern int port_installed;
+const char *port_data_root(void);  // ".../files" and ".../mods" below it
+const char *port_save_root(void);  // NAND emulation root
 #define PORT_LOG_COLS 240
 int port_log_snapshot(char out[][PORT_LOG_COLS], int rows);
 void port_log_udp_start(void);

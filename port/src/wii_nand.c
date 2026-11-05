@@ -33,7 +33,7 @@ static int no_save(void)
 #define NLOG(fmt, ...) do { OSThread *t_ = OSGetCurrentThread(); \
    WHBLogPrintf("[nand] " fmt " (thread %s, irq %d)", __VA_ARGS__, t_ && t_->name ? t_->name : "?", OSIsInterruptEnabled()); } while (0)
 
-#define SAVE_ROOT "fs:/vol/external01/rayman/save/nand"
+#define SAVE_ROOT port_save_root()
 #define HOME_DIR "/title/00010000/53584f50/data"
 
 enum {
@@ -56,7 +56,7 @@ static void make_dirs(const char *path)
 {
    char tmp[512];
    snprintf(tmp, sizeof(tmp), "%s", path);
-   for (char *p = tmp + strlen("fs:/vol/external01/"); *p; p++) {
+   for (char *p = tmp + strlen("fs:/vol/"); *p; p++) { // existing levels just fail
       if (*p != '/') continue;
       *p = 0;
       mkdir(tmp, 0777);

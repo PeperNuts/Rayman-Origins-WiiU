@@ -202,7 +202,7 @@ static int glsl_init(void)
                    (unsigned)OSTicksToMilliseconds(OSGetSystemTime() - t0));
    }
    if (e != OS_DYNLOAD_OK) {
-      WHBLogPrintf("[gfx] glslcompiler.rpl not found - copy it to sd:/wiiu/libs/");
+      WHBLogPrintf("[gfx] glslcompiler.rpl not found - copy it to sd:/wiiu/libs/ (or code/ of an installed title)");
       return 0;
    }
    void (*init)(void) = NULL;
@@ -671,7 +671,7 @@ static void icons_load(void)
    static const char *const names[3] = {NULL, "gamepad", "pro"};
    for (int k = 1; k < 3; k++) {
       char path[128];
-      snprintf(path, sizeof(path), "fs:/vol/external01/rayman/mods/icons/%s.bin", names[k]);
+      snprintf(path, sizeof(path), "%s/mods/icons/%s.bin", port_data_root(), names[k]);
       FILE *f = fopen(path, "rb");
       if (!f) continue;
       uint8_t *b = MEMAllocFromDefaultHeapEx(2 * ICON_HALF, 64);

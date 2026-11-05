@@ -17,13 +17,15 @@
 #include <whb/proc.h>
 #include <proc_ui/procui.h>
 
+#include <nn/save.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "port.h"
 
-#define PORT_VERSION "first-boot 76"
+#define PORT_VERSION "first-boot 77"
 #define GAME_STACK_SIZE (4u << 20)
 
 // Read by the patched game code in place of the Wii's 0x800000F8.
@@ -117,6 +119,27 @@ static int game_thread(int argc, const char **argv)
    sStage = 3;
    WHBLogPrintf("[boot] game main() returned %d", ret);
    return ret;
+}
+
+int port_installed;
+const char *port_data_root(void)
+{
+   return port_installed ? "fs:/vol/content" : "fs:/vol/external01/rayman";
+}
+const char *port_save_root(void)
+{
+   return port_installed ? "fs:/vol/save/common/nand" : "fs:/vol/external01/rayman/save/nand";
+}
+static void detect_installed(void)
+{
+   struct stat st;
+   port_installed = stat("fs:/vol/content/files/bootsequence_WII.ipk", &st) == 0;
+   if (port_installed) {
+      SAVEInit();
+      SAVEInitSaveDir(0xFF); // common save directory: /vol/save/common
+   }
+   WHBLogPrintf("[boot] %s: game data in %s, saves in %s", port_installed ? "installed title" : "started from the SD card",
+                port_data_root(), port_save_root());
 }
 
 // sd:/rayman/port.cfg: words that switch features off for testing (e.g. "noefb nocopy").
@@ -231,6 +254,7 @@ int main(int argc, char **argv)
    WHBLogPrintf("[boot] sda anchors r13=%p r2=%p (os had %08X %08X)", _SDA_BASE_, _SDA2_BASE_,
                 (unsigned)read_r13(), (unsigned)read_r2());
 
+   detect_installed();
    port_mem_init();
    port_watch_start(); // first, so it reports even if start-up hangs
    port_dvd_init();
