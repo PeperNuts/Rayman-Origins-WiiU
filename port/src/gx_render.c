@@ -480,7 +480,7 @@ static void dyn_changed(uint32_t image)
 int gx_tex_is_dynamic(uint32_t image)
 {
    int i = dyn_find(image);
-   return i >= 0 && sDynCount[i] >= 2;
+   return i >= 0 && sDynCount[i] >= 1;
 }
 
 static uint32_t content_hash(const GxTexKey *k)
@@ -492,7 +492,10 @@ static uint32_t content_hash(const GxTexKey *k)
    static int oldHash = -1;
    if (oldHash < 0) oldHash = port_cfg("oldhash"); // only the 16 samples, as before first-boot 65
    int d = oldHash ? -1 : dyn_find(k->image);
-   if (d >= 0 && sDynCount[d] >= 2) {
+   // Large I8 textures (video planes) are always compared in full: a mostly flat video frame
+   // (the Ubisoft logo) changes nowhere near the 16 samples, so mixed frames went unnoticed.
+   int bigI8 = !oldHash && k->fmt == 1 && k->width * k->height >= 64000;
+   if (bigI8 || (d >= 0 && sDynCount[d] >= 1)) {
       uint32_t a = h, b = 0x9E3779B9u;
       uint32_t i = 0;
       for (; i + 4 <= n; i += 4) {
