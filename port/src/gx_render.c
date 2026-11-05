@@ -1168,7 +1168,11 @@ static void apply_state(const GxState *st)
    }
    if (sSurfaceCopied) bind_efb();
    const float *v = st->viewport;
-   GX2SetViewport(v[0] * EFB_SCALE, v[1] * EFB_SCALE, v[2] * EFB_SCALE, v[3] * EFB_SCALE, v[4], v[5]);
+   // Above the Wii resolution, a quarter-pixel shift keeps every sample off the exact border
+   // between two Wii pixels: there the two triangles of a quad rounded differently (the video
+   // shader's 4-row lookup texture gave grey stripes in one half of the Ubisoft intro).
+   float q = EFB_SCALE != 1.0f ? 0.25f : 0.0f;
+   GX2SetViewport(v[0] * EFB_SCALE + q, v[1] * EFB_SCALE + q, v[2] * EFB_SCALE, v[3] * EFB_SCALE, v[4], v[5]);
    int x = clampi(SC(st->scissor[0]), 0, EFB_W), y = clampi(SC(st->scissor[1]), 0, EFB_H);
    int w = clampi(SC(st->scissor[0] + st->scissor[2]) - x, 0, EFB_W - x), h = clampi(SC(st->scissor[1] + st->scissor[3]) - y, 0, EFB_H - y);
    GX2SetScissor(x, y, w ? w : 1, h ? h : 1);

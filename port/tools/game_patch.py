@@ -25,6 +25,11 @@ PATCHES = [
     # matches the address encoding the voice reports: compare the plain addresses instead.
     ('postCallback__Q24raki22ADPCMStreamSoundNativeFv', 0x54, 0x3CA58000, 0x60000000),  # addis r5,r5,-32768 -> nop
     ('postCallback__Q24raki22ADPCMStreamSoundNativeFv', 0x64, 0x3C848000, 0x60000000),  # addis r4,r4,-32768 -> nop
+    # Wii Health & Safety screen (SystemAdapter_SplashScreen::update, states 1 fade in,
+    # 2 wait for a button / time, 3 fade out): every state ends at once.
+    ('update__Q23ITF26SystemAdapter_SplashScreenFv', 0x094, 0x40800028, 0x60000000),  # fade in: bge (still fading) -> nop
+    ('update__Q23ITF26SystemAdapter_SplashScreenFv', 0x0F0, 0x40800060, 0x60000000),  # fade out: bge (still fading) -> nop
+    ('update__Q23ITF26SystemAdapter_SplashScreenFv', 0x1C8, 0x41800020, 0x48000020),  # wait: blt (time up) -> b
 ]
 
 syms = {}
