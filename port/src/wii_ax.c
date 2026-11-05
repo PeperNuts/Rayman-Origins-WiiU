@@ -206,6 +206,7 @@ typedef struct {
    volatile uint32_t rd, wr; // frames, monotonic
    int32_t vol;              // 0..32768
    int32_t l0, r0, l1, r1;
+   uint8_t *bink; // the BINK the track belongs to (diagnostics)
 } BinkTrack;
 static BinkTrack sBink[MAX_BINK];
 // Diagnostics (video sound): calls and data per second, logged by the watch thread.
@@ -218,6 +219,16 @@ void port_bink_stats(void)
       uint8_t *bs = t->bs;
       uint32_t w2c, w54, w0, w18;
       memcpy(&w2c, bs + 0x2C, 4); memcpy(&w54, bs + 0x54, 4); memcpy(&w0, bs, 4); memcpy(&w18, bs + 0x18, 4);
+      // Bink's sound pump (pump_sound / checksound) only reaches the driver when these allow it
+      extern char _SDA_BASE_[];
+      uint32_t g9c, g7c, g80, g20, b124 = 0, b12c = 0, b460 = 0, b154 = 0, s4c;
+      memcpy(&g9c, _SDA_BASE_ - 28004, 4); memcpy(&g7c, _SDA_BASE_ - 28036, 4);
+      memcpy(&g80, _SDA_BASE_ - 28032, 4); memcpy(&g20, _SDA_BASE_ - 32736, 4);
+      if (t->bink) { memcpy(&b124, t->bink + 292, 4); memcpy(&b12c, t->bink + 300, 4); memcpy(&b460, t->bink + 1120, 4); memcpy(&b154, t->bink + 340, 4); }
+      memcpy(&s4c, bs + 0x4C, 4);
+      WHBLogPrintf("[bink] gates: shutdown %u, active %u, list %08X, wait %u ms | bink %p: tracks %u, +300 %u, +1120 %u, "
+                   "snd %08X (bs %p), bs+0x4C %d", (unsigned)g9c, (unsigned)g7c, (unsigned)g80, (unsigned)g20, t->bink,
+                   (unsigned)b124, (unsigned)b12c, (unsigned)b460, (unsigned)b154, bs, (int)s4c);
       WHBLogPrintf("[bink] track %d: ready %u (yes %u), lock %u, %u bytes in, %u frames mixed, starved %u, "
                    "buffered %u, vol %d, on %d, paused %d | bs 0x00 %08X 0x18 %08X 0x2C %08X 0x54 %08X",
                    i, (unsigned)sBkReady, (unsigned)sBkReadyYes, (unsigned)sBkLock, (unsigned)sBkUnlockBytes,
@@ -342,6 +353,7 @@ static int32_t bink_open(uint8_t *bs, uint32_t freq, int32_t bits, int32_t chans
    t->frac = 0; t->rd = t->wr = 0;
    t->vol = 32768; t->paused = 0; t->on = 1;
    t->l0 = t->r0 = t->l1 = t->r1 = 0;
+   t->bink = bink;
    t->used = 1;
    OSRestoreInterrupts(en);
    static void *const fns[9] = {(void *)bink_ready, (void *)bink_lock, (void *)bink_unlock, (void *)bink_volume,
