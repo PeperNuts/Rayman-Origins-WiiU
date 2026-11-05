@@ -203,6 +203,8 @@ static int watch_main(int argc, const char **argv)
          } else if (!port_paused) hb = 0;
       }
 
+      { extern void port_bink_stats(void); port_bink_stats(); } // video sound, while a video plays
+
       const char *why = NULL;
       if (frozen == 5) why = "CPU1 stopped taking interrupts for 5 s (frame clock frozen)";
       if (why) {

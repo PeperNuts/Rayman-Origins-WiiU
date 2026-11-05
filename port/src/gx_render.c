@@ -1754,7 +1754,11 @@ static int render_main(int argc, const char **argv)
       static uint32_t lastLines = 0xFFFFFFFF;
       uint32_t lines = port_log_count();
       if (sPadGame < 0) sPadGame = !port_cfg("padlog");
-      int padLog = !sPadGame || !sHaveShaders || pk->black; // the log until the game shows a picture
+      // On-screen text (TV status bar, GamePad log during start-up) only with "debug" in
+      // port.cfg; the network log is always sent.
+      static int sDebug = -1;
+      if (sDebug < 0) sDebug = port_cfg("debug");
+      int padLog = !sPadGame || (sDebug && (!sHaveShaders || pk->black)); // the log until the game shows a picture
       if (padLog && lines != lastLines && OSGetSystemTime() - lastPad > OSMillisecondsToTicks(200)) {
          lastPad = OSGetSystemTime();
          lastLines = lines;
@@ -1770,7 +1774,7 @@ static int render_main(int argc, const char **argv)
                (unsigned)sLastVerts, (unsigned)sNumTex, (unsigned)(sTexBytes >> 20), pk->black ? "  [VI black]" : "",
                sHaveShaders ? "" : sShaderDone ? "  [no shaders - see log]" : "  [compiling shaders]");
       static uint32_t lastStrip = 0xFFFFFFFF;
-      if (secs != lastStrip) { // once a second
+      if (sDebug && secs != lastStrip) { // once a second
          lastStrip = secs;
          port_fill(&strip, 0x000000FF);
          port_text(&strip, 4, 2 * big, big, l, 0xFFFFFFFF);
@@ -1789,7 +1793,7 @@ static int render_main(int argc, const char **argv)
       if (pk->black) WHBGfxClearColor(0, 0, 0, 1);
       else if (sHaveShaders) STEP("present EFB to TV", present_tv(pk));
       else WHBGfxClearColor((cc >> 24) / 255.0f, ((cc >> 16) & 255) / 255.0f, ((cc >> 8) & 255) / 255.0f, 1.0f);
-      port_blit(&strip, &tv->surface, 0, (int)tv->surface.height - (int)strip.height);
+      if (sDebug) port_blit(&strip, &tv->surface, 0, (int)tv->surface.height - (int)strip.height);
       WHBGfxFinishRenderTV();
       // GamePad: the game (default) or the log; L stick + R stick clicked together switches.
       static uint32_t padPrev;
@@ -1799,8 +1803,8 @@ static int render_main(int argc, const char **argv)
       padPrev = ph;
       WHBGfxBeginRenderDRC();
       WHBGfxClearColor(0, 0, 0, 1);
-      if (!padLog) present_tv(pk);
-      else port_blit(&pad, &drc->surface, 0, 0);
+      if (padLog) port_blit(&pad, &drc->surface, 0, 0);
+      else if (sHaveShaders && !pk->black) present_tv(pk);
       WHBGfxFinishRenderDRC();
       gx_render_step = "finish";
       OSTime tf0 = OSGetSystemTime();

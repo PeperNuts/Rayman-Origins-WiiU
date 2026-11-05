@@ -208,6 +208,24 @@ typedef struct {
    int32_t l0, r0, l1, r1;
 } BinkTrack;
 static BinkTrack sBink[MAX_BINK];
+// Diagnostics (video sound): calls and data per second, logged by the watch thread.
+static volatile uint32_t sBkReady, sBkReadyYes, sBkLock, sBkUnlockBytes, sBkMixed, sBkStarved;
+void port_bink_stats(void)
+{
+   for (int i = 0; i < MAX_BINK; i++) {
+      BinkTrack *t = &sBink[i];
+      if (!t->used) continue;
+      uint8_t *bs = t->bs;
+      uint32_t w2c, w54, w0, w18;
+      memcpy(&w2c, bs + 0x2C, 4); memcpy(&w54, bs + 0x54, 4); memcpy(&w0, bs, 4); memcpy(&w18, bs + 0x18, 4);
+      WHBLogPrintf("[bink] track %d: ready %u (yes %u), lock %u, %u bytes in, %u frames mixed, starved %u, "
+                   "buffered %u, vol %d, on %d, paused %d | bs 0x00 %08X 0x18 %08X 0x2C %08X 0x54 %08X",
+                   i, (unsigned)sBkReady, (unsigned)sBkReadyYes, (unsigned)sBkLock, (unsigned)sBkUnlockBytes,
+                   (unsigned)sBkMixed, (unsigned)sBkStarved, (unsigned)(t->wr - t->rd), (int)t->vol, t->on, t->paused,
+                   (unsigned)w0, (unsigned)w18, (unsigned)w2c, (unsigned)w54);
+   }
+   sBkReady = sBkReadyYes = sBkLock = sBkUnlockBytes = sBkMixed = sBkStarved = 0;
+}
 
 static BinkTrack *bink_of(void *bs)
 {
@@ -232,6 +250,7 @@ static void mix_bink(int32_t *accL, int32_t *accR)
    for (int i = 0; i < MAX_BINK; i++) {
       BinkTrack *t = &sBink[i];
       if (!t->used || t->paused || !t->on) continue;
+      sBkMixed += FRAME;
       for (int n = 0; n < FRAME; n++) {
          int32_t f = (int32_t)(t->frac >> 1);
          int32_t l = t->l0 + (((t->l1 - t->l0) * f) >> 15), r = t->r0 + (((t->r1 - t->r0) * f) >> 15);
@@ -240,7 +259,7 @@ static void mix_bink(int32_t *accL, int32_t *accR)
          t->frac += t->step;
          while (t->frac >= 0x10000) {
             t->frac -= 0x10000;
-            if (!bink_next(t)) { t->frac = 0; break; } // starved: hold
+            if (!bink_next(t)) { t->frac = 0; sBkStarved++; break; } // starved: hold
          }
       }
    }
@@ -249,12 +268,16 @@ static void mix_bink(int32_t *accL, int32_t *accR)
 static int32_t bink_ready(uint8_t *bs)
 {
    BinkTrack *t = bink_of(bs);
-   return t && BINK_FRAMES - (t->wr - t->rd) >= 256;
+   sBkReady++;
+   int r = t && BINK_FRAMES - (t->wr - t->rd) >= 256;
+   sBkReadyYes += r;
+   return r;
 }
 
 static int32_t bink_lock(uint8_t *bs, uint8_t **addr, uint32_t *len)
 {
    BinkTrack *t = bink_of(bs);
+   sBkLock++;
    if (!t) return 0;
    uint32_t used = t->wr - t->rd, free = BINK_FRAMES - used;
    uint32_t at = t->wr % BINK_FRAMES, run = BINK_FRAMES - at;
@@ -270,6 +293,7 @@ static int32_t bink_unlock(uint8_t *bs, uint32_t filled)
    BinkTrack *t = bink_of(bs);
    if (!t) return 0;
    __asm__ volatile("sync" ::: "memory");
+   sBkUnlockBytes += filled;
    t->wr += filled / (t->chans * 2);
    return 1;
 }
